@@ -3,14 +3,14 @@ set -x
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/data/gsm8k/train.parquet \
-    data.val_files=$HOME/data/gsm8k/test.parquet \
+    data.train_files=/home/wuyu/BNTO/BNTO_verl/data/test_set/omni-math.parquet \
+    data.val_files=/home/wuyu/BNTO/BNTO_verl/data/train_set/dapo-math-modified.parquet \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct \
+    actor_rollout_ref.model.path=/data/local_disk0/wuyu/model/qwen/Qwen2.5-7B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -31,9 +31,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
-    trainer.project_name='verl_grpo_example_gsm8k' \
-    trainer.experiment_name='qwen2_7b_function_rm' \
+    trainer.logger='["console","swanlab"]' \
+    trainer.project_name='BNTO_verl' \
+    trainer.experiment_name='qwen2.5_7b_function_rm_dapo' \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
