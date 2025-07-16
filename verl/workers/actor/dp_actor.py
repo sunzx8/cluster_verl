@@ -484,3 +484,18 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
+        """Update loss coefficients for dual-game RL.
+        
+        Args:
+            lambda_coef (float, optional): Lambda coefficient for entropy penalty
+            kl_coef (float, optional): Beta coefficient for KL penalty
+        """
+        if lambda_coef is not None:
+            if not hasattr(self.config.policy_loss, 'dual_game'):
+                from omegaconf import DictConfig
+                self.config.policy_loss.dual_game = DictConfig({})
+            self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+        if kl_coef is not None:
+            self.config.kl_loss_coef = float(kl_coef)

@@ -1,0 +1,93 @@
+# Dual-Game PPO Configuration
+# This configuration enables the dual-game RL algorithm with entropy budget control
+
+# Use the same defaults as regular PPO
+defaults:
+  - actor@actor_rollout_ref.actor: dp_actor
+  - npu_profile@trainer.npu_profile: npu_profile
+  - data@data: legacy_data
+  - ref@actor_rollout_ref.ref: dp_ref
+  - rollout@actor_rollout_ref.rollout: rollout
+  - critic@critic: dp_critic
+  - reward_model@reward_model: dp_reward_model
+  - _self_
+
+# config for actor, rollout and reference model
+actor_rollout_ref:
+  hybrid_engine: true
+  
+  model:
+    path: ~/models/deepseek-llm-7b-chat
+    custom_chat_template: null
+  
+  actor:
+    # Override policy loss configuration for dual-game
+    policy_loss:
+      # Set loss mode to dual_game
+      loss_mode: "dual_game"
+      
+      # Dual-game specific parameters
+      dual_game:
+        # Negative advantage amplification factor (γ in paper)
+        gamma: 0.8
+        
+        # Lambda coefficient (will be updated during training)
+        lambda_coef: 0.0
+    
+    # KL loss coefficient (beta in paper, managed by existing KL controller)
+    kl_loss_coef: 0.0
+
+# Algorithm configuration with entropy budget control
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  
+  # Standard PPO parameters
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: gae
+  norm_adv_by_std_in_grpo: True
+  
+  # Enable KL penalty in reward
+  use_kl_in_reward: True
+  kl_penalty: kl
+  
+  # KL control for beta coefficient
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: adaptive
+    kl_coef: 0.01
+    horizon: 1000
+    target_kl: 0.1
+
+# Entropy budget control configuration
+entropy_budget:
+  # Initial entropy budget B0
+  target: 5.0
+  
+  # Initial lambda coefficient  
+  lambda_init: 0.0
+  
+  # Learning rate for lambda updates (alpha_lambda)
+  lambda_lr: 0.05
+  
+  # Decay rate for entropy budget (approximates exp(-alpha*step/T))
+  decay_rate: 0.999
+
+# Training configuration
+trainer:
+  total_epochs: 3
+  critic_warmup: 0
+  test_freq: 50
+  save_freq: 500
+  project_name: dual_game_ppo
+  experiment_name: entropy_budget_experiment
+  logger: wandb
+
+# Data configuration  
+data:
+  train_batch_size: 32
+  val_batch_size: 32
+  train_files: null
+  val_files: null
+  
+# Other standard configurations remain the same... 

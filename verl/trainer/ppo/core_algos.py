@@ -168,6 +168,43 @@ class FixedKLController:
         pass
 
 
+class EntropyBudgetController:
+    """
+    Entropy budget controller for Dual-Game RL algorithm.
+    
+    Manages the lambda coefficient and entropy budget B according to:
+    lambda <- [lambda + alpha_lambda * (B - sum(w_t * H_t))]_+
+    B <- B0 * exp(-alpha * step / T)
+    """
+
+    def __init__(self, target, lambda_init=0.0, lambda_lr=0.05, decay_rate=0.999):
+        """Initialize entropy budget controller.
+        
+        Args:
+            target (float): Initial entropy budget B0
+            lambda_init (float): Initial lambda coefficient
+            lambda_lr (float): Learning rate for lambda updates (alpha_lambda)
+            decay_rate (float): Decay rate for entropy budget (exp(-alpha/T) approximation)
+        """
+        self.value = lambda_init  # lambda coefficient
+        self.target = target      # current entropy budget B
+        self.lambda_lr = lambda_lr
+        self.decay_rate = decay_rate
+
+    def update(self, current_wH_sum):
+        """Update lambda coefficient based on current weighted entropy sum.
+        
+        Args:
+            current_wH_sum (float): Current sum of w_t * H_t
+        """
+        # lambda <- [lambda + alpha_lambda * (B - sum(w_t * H_t))]_+
+        self.value = max(0.0, self.value + self.lambda_lr * (self.target - current_wH_sum))
+
+    def decay_target(self):
+        """Decay the entropy budget target: B <- B * decay_rate"""
+        self.target *= self.decay_rate
+
+
 def get_kl_controller(kl_ctrl):
     """Factory function to create appropriate KL controller based on configuration.
 
@@ -1146,3 +1183,76 @@ def compute_pf_ppo_reweight_data(
     resampled_data.meta_info = resampled_meta_info
 
     return resampled_data
+
+
+@register_policy_loss("dual_game")
+def compute_policy_loss_dual_game(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the dual-game policy loss combining PPO-clip, entropy penalty, and KL penalty.
+    
+    Implements the gradient: g_{i,t} = [(Â⁺ + γÂ⁻) − λw_t(−logp−1) − β(logp−logp₀)] · ∇θlogp
+    where w_t = p_t(1−p_t)|Â_t|, H_t = −p_t logp_t
+    
+    Args:
+        old_log_prob (torch.Tensor): Log-probabilities under old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor): Log-probabilities under current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor): Advantage estimates, shape (batch_size, response_length).
+        response_mask (torch.Tensor): Mask for valid tokens, shape (batch_size, response_length).
+        loss_agg_mode (str): Aggregation mode for loss computation.
+        config (AlgoConfig): Configuration containing dual_game parameters.
+        
+    Returns:
+        tuple: (pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower)
+    """
+    if config is None:
+        raise ValueError("config is required for dual_game loss")
+    
+    # Get dual-game parameters
+    dual_game_config = config.policy_loss.dual_game
+    gamma = dual_game_config.get("gamma", 0.8)
+    lambda_coef = dual_game_config.get("lambda_coef", 0.0)
+    
+    # Get beta from kl_loss_coef (managed by existing KL controller)
+    beta_coef = getattr(config, "kl_loss_coef", 0.0)
+    
+    # Get clipping parameters
+    cliprange = config.clip_ratio
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+    
+    # Compute modified advantages: Â⁺ + γÂ⁻
+    adv_positive = torch.clamp(advantages, min=0.0)
+    adv_negative = torch.clamp(advantages, max=0.0)
+    adv_modified = adv_positive + gamma * adv_negative
+    
+    # Compute standard PPO clipped loss with modified advantages
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    pg_losses1 = -adv_modified * ratio
+    pg_losses2 = -adv_modified * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    
+    clip_pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    
+    # Compute entropy penalty: λw_t(−logp−1)
+    prob = torch.exp(log_prob)
+    w = prob * (1 - prob) * torch.abs(advantages)  # w_t = p_t(1−p_t)|Â_t|
+    entropy_penalty = lambda_coef * w * (-log_prob - 1)
+    
+    # Compute KL penalty: β(logp−logp₀)
+    kl_penalty = beta_coef * (log_prob - old_log_prob)
+    
+    # Combine all terms
+    pg_losses = clip_pg_losses + entropy_penalty + kl_penalty
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)

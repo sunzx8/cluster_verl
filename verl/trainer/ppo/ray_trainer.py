@@ -384,6 +384,13 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        
+        # Initialize entropy budget controller for dual-game RL
+        if hasattr(self.config, 'entropy_budget'):
+            from verl.trainer.ppo.core_algos import EntropyBudgetController
+            self.entropy_ctrl = EntropyBudgetController(**self.config.entropy_budget)
+        else:
+            self.entropy_ctrl = None
 
     def _validate_config(self):
         config = self.config
@@ -1313,6 +1320,44 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # Update dual-game coefficients before actor update
+                        if (self.entropy_ctrl is not None and 
+                            hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'loss_mode') and
+                            self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dual_game"):
+                            
+                            with marked_timer("dual_game_update", timing_raw, color="purple"):
+                                # Compute weighted entropy sum: Σ w_t H_t
+                                resp_mask = batch.batch["response_mask"]
+                                adv = batch.batch["advantages"] 
+                                logp = batch.batch["old_log_probs"]
+                                prob = torch.exp(logp)
+                                H = -(prob * logp)  # entropy H_t = -p_t * log p_t
+                                w = prob * (1 - prob) * torch.abs(adv)  # w_t = p_t(1-p_t)|Â_t|
+                                wH_sum = torch.sum(w * H * resp_mask).item()
+                                
+                                # Update lambda and entropy budget
+                                self.entropy_ctrl.update(wH_sum)
+                                self.entropy_ctrl.decay_target()
+                                
+                                # Update coefficients in config for actor workers
+                                if not hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'dual_game'):
+                                    from omegaconf import DictConfig
+                                    self.config.actor_rollout_ref.actor.policy_loss.dual_game = DictConfig({})
+                                
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = self.entropy_ctrl.value
+                                
+                                # Update beta from existing KL controller if available
+                                if hasattr(self, 'kl_ctrl_in_reward') and self.kl_ctrl_in_reward is not None:
+                                    self.config.actor_rollout_ref.actor.kl_loss_coef = self.kl_ctrl_in_reward.value
+                                
+                                # Log dual-game metrics
+                                dual_metrics = {
+                                    "dual_game/lambda": self.entropy_ctrl.value,
+                                    "dual_game/entropy_budget": self.entropy_ctrl.target,
+                                    "dual_game/wH_sum": wH_sum,
+                                }
+                                metrics.update(dual_metrics)
+                        
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
