@@ -168,6 +168,33 @@ class FixedKLController:
         pass
 
 
+# ----------------- Dual-Game: Linear KL Controller -----------------
+# Implements β ← [β + αβ (D_kl − D)]_{+}
+
+
+class LinearKLController:
+    """Linear (additive) KL controller for Dual-Game RL.
+
+    Args:
+        init_beta (float): Initial β coefficient.
+        target_kl (float): Desired KL divergence D.
+        beta_lr   (float): Learning rate αβ for the dual update.
+    """
+
+    def __init__(self, init_beta: float, target_kl: float, beta_lr: float):
+        self.value = init_beta
+        self.target = target_kl
+        self.beta_lr = beta_lr
+
+    def update(self, current_kl: float, n_steps: int = 1):
+        """Additive dual update.
+
+        β ← [ β + αβ (D_kl − D) ]_{+}
+        """
+        delta = self.beta_lr * (current_kl - self.target)
+        self.value = max(0.0, self.value + delta)
+
+
 class EntropyBudgetController:
     """
     Entropy budget controller for Dual-Game RL algorithm.
@@ -223,6 +250,11 @@ def get_kl_controller(kl_ctrl):
     elif kl_ctrl.type == "adaptive":
         assert kl_ctrl.horizon > 0, f"horizon must be larger than 0. Got {kl_ctrl.horizon}"
         return AdaptiveKLController(init_kl_coef=kl_ctrl.kl_coef, target_kl=kl_ctrl.target_kl, horizon=kl_ctrl.horizon)
+    elif kl_ctrl.type == "linear":
+        # Support both new naming (beta_init/beta_lr) and fallback to kl_coef if provided
+        init_beta = getattr(kl_ctrl, "beta_init", getattr(kl_ctrl, "kl_coef", 0.0))
+        beta_lr = getattr(kl_ctrl, "beta_lr", 0.01)
+        return LinearKLController(init_beta=init_beta, target_kl=kl_ctrl.target_kl, beta_lr=beta_lr)
     else:
         raise NotImplementedError
 
@@ -1219,8 +1251,8 @@ def compute_policy_loss_dual_game(
     gamma = dual_game_config.get("gamma", 0.8)
     lambda_coef = dual_game_config.get("lambda_coef", 0.0)
     
-    # Get beta from kl_loss_coef (managed by existing KL controller)
-    beta_coef = getattr(config, "kl_loss_coef", 0.0)
+    # Get beta from dual_game beta coefficient (trainer will update each batch)
+    beta_coef = dual_game_config.get("beta_coef", 0.0)
     
     # Get clipping parameters
     cliprange = config.clip_ratio

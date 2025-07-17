@@ -498,4 +498,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.config.policy_loss.dual_game = DictConfig({})
             self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
         if kl_coef is not None:
-            self.config.kl_loss_coef = float(kl_coef)
+            if not hasattr(self.config.policy_loss, 'dual_game'):
+                from omegaconf import DictConfig
+                self.config.policy_loss.dual_game = DictConfig({})
+            self.config.policy_loss.dual_game.beta_coef = float(kl_coef)

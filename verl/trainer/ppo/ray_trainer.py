@@ -392,6 +392,13 @@ class RayPPOTrainer:
         else:
             self.entropy_ctrl = None
 
+        # Initialize beta (KL) controller for dual-game RL, independent of reward-KL path
+        if hasattr(self.config, 'dual_game'):
+            from verl.trainer.ppo.core_algos import get_kl_controller
+            self.beta_ctrl = get_kl_controller(self.config.dual_game)
+        else:
+            self.beta_ctrl = None
+
     def _validate_config(self):
         config = self.config
         # number of GPUs total
@@ -1341,38 +1348,44 @@ class RayPPOTrainer:
                                 self.entropy_ctrl.update(wH_sum)
                                 self.entropy_ctrl.decay_target()
                                 
-                                # Update coefficients in config for actor workers
-                                if not hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'dual_game'):
-                                    from omegaconf import DictConfig
-                                    self.config.actor_rollout_ref.actor.policy_loss.dual_game = DictConfig({})
-                                
-                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = self.entropy_ctrl.value
-                                
-                                # Update beta from existing KL controller if available
-                                if hasattr(self, 'kl_ctrl_in_reward') and self.kl_ctrl_in_reward is not None:
-                                    self.config.actor_rollout_ref.actor.kl_loss_coef = self.kl_ctrl_in_reward.value
-                                
-                                # Log dual-game metrics
-                                dual_metrics = {
-                                    "dual_game/lambda": self.entropy_ctrl.value,
-                                    "dual_game/entropy_budget": self.entropy_ctrl.target,
-                                    "dual_game/wH_sum": wH_sum,
-                                }
-                                metrics.update(dual_metrics)
+                                # ----- 计算 KL, 更新 beta_ctrl -----
+                                if self.beta_ctrl is not None:
+                                    import torch
+                                    kld_mat = core_algos.kl_penalty(
+                                        batch.batch["old_log_probs"],
+                                        batch.batch["ref_log_prob"],
+                                        kl_penalty="low_var_kl",
+                                    )
+                                    kld_value = torch.mean(kld_mat * resp_mask).item()
+                                    self.beta_ctrl.update(current_kl=kld_value, n_steps=batch.batch_size[0])
+                                    beta_val = self.beta_ctrl.value
+                                else:
+                                    kld_value = 0.0
+                                    beta_val = 0.0
 
-                                # ---- 广播 Dual-Game 系数到全部 Actor Worker ----
-                                beta_val = (
-                                    self.kl_ctrl_in_reward.value
-                                    if hasattr(self, "kl_ctrl_in_reward") and self.kl_ctrl_in_reward is not None
-                                    else self.config.actor_rollout_ref.actor.kl_loss_coef
-                                )
+                                # 写回 config 供日志 & Actor 使用
+                                if not hasattr(self.config, 'dual_game'):
+                                    from omegaconf import DictConfig
+                                    self.config.dual_game = DictConfig({})
+                                self.config.dual_game.beta_coef = beta_val
+
+                                # 广播 λ、β 到 Actor
                                 self.actor_rollout_wg.execute_all_sync(
                                     "set_loss_coefficients",
                                     lambda_coef=self.entropy_ctrl.value,
                                     kl_coef=beta_val,
                                 )
-                                # ------------------------------------------------
-                        
+
+                                # Log dual-game metrics
+                                dual_metrics = {
+                                    "dual_game/lambda": self.entropy_ctrl.value,
+                                    "dual_game/entropy_budget": self.entropy_ctrl.target,
+                                    "dual_game/wH_sum": wH_sum,
+                                    "dual_game/beta": beta_val,
+                                    "dual_game/kl": kld_value,
+                                }
+                                metrics.update(dual_metrics)
+
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
