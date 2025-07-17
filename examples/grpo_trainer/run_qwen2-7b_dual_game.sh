@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -x
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_LAUNCH_BLOCKING=1
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+# Dual-Game PPO Training Script for Qwen2.5-7B
+# Based on dual_game_ppo_trainer.yaml configuration
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    algorithm.gamma=1.0 \
+    algorithm.lam=1.0 \
+    algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.use_kl_in_reward=True \
+    algorithm.kl_penalty=kl \
+    algorithm.kl_ctrl.type=adaptive \
+    algorithm.kl_ctrl.kl_coef=0.01 \
+    algorithm.kl_ctrl.horizon=1000 \
+    algorithm.kl_ctrl.target_kl=0.1 \
+    data.train_files=/home/wuyu/BNTO/BNTO_verl/data/test_set/omni-math.parquet \
+    data.val_files=/home/wuyu/BNTO/BNTO_verl/data/train_set/dapo-math-modified.parquet \
+    data.train_batch_size=32 \
+    data.max_prompt_length=512 \
+    data.max_response_length=1024 \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    actor_rollout_ref.model.path=/data/local_disk0/wuyu/model/qwen/Qwen2.5-7B \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.policy_loss.loss_mode=dual_game \
+    +actor_rollout_ref.actor.policy_loss.dual_game.gamma=0.8 \
+    +actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef=0.0 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.n=5 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    +entropy_budget.target=5.0 \
+    +entropy_budget.lambda_init=0.0 \
+    +entropy_budget.lambda_lr=0.05 \
+    +entropy_budget.decay_rate=0.999 \
+    trainer.critic_warmup=0 \
+    reward_model.reward_manager=naive \
+    trainer.logger='["console","swanlab"]' \
+    trainer.project_name='dual_game_ppo' \
+    trainer.experiment_name='qwen2.5_7b_dual_game_entropy_budget' \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=2 \
+    trainer.save_freq=500 \
+    trainer.test_freq=50 \
+    trainer.total_epochs=3 $@ 
