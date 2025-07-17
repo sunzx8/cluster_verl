@@ -383,6 +383,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return rollout, sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
+        """同步 Dual-Game λ、β 系数到本 Worker 所有 rank。"""
+        if self._is_actor:
+            # 仅 actor 角色需要更新；rollout/ref/critic 直接忽略
+            self.actor.set_loss_coefficients(lambda_coef=lambda_coef, kl_coef=kl_coef)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems

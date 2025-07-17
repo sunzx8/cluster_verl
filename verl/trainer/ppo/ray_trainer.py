@@ -1359,6 +1359,19 @@ class RayPPOTrainer:
                                     "dual_game/wH_sum": wH_sum,
                                 }
                                 metrics.update(dual_metrics)
+
+                                # ---- 广播 Dual-Game 系数到全部 Actor Worker ----
+                                beta_val = (
+                                    self.kl_ctrl_in_reward.value
+                                    if hasattr(self, "kl_ctrl_in_reward") and self.kl_ctrl_in_reward is not None
+                                    else self.config.actor_rollout_ref.actor.kl_loss_coef
+                                )
+                                self.actor_rollout_wg.execute_all_sync(
+                                    "set_loss_coefficients",
+                                    lambda_coef=self.entropy_ctrl.value,
+                                    kl_coef=beta_val,
+                                )
+                                # ------------------------------------------------
                         
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
