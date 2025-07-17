@@ -914,6 +914,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Stop profiling for the current rank in the current training step."""
         self.profiler.stop()
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
+        """同步 Dual-Game λ、β 系数到本 Worker 所有 rank。"""
+        if self._is_actor:
+            self.actor.set_loss_coefficients(lambda_coef=lambda_coef, kl_coef=kl_coef)
+
 
 class CriticWorker(Worker, DistProfilerExtension):
     def __init__(self, config):
