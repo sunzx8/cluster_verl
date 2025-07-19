@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-export SWANLAB_API_KEY=YOUR_WANDB_API_KEY
+export WANDB_API_KEY=YOUR_WANDB_API_KEY
 # export VLLM_USE_V1=1
 
-project_name='Qwen2.5-7B-test'
-exp_name='klcov'
+project_name='Qwen2.5-7B'
+exp_name='clipcov'
 
 adv_estimator=grpo
 
@@ -14,8 +14,11 @@ kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 
-clip_ratio_low=0.2
-clip_ratio_high=0.2
+clip_ratio_low=1
+clip_ratio_high=1
+clip_cov_ratio=0.0002
+clip_cov_lb=1.0
+clip_cov_ub=5.0
 
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 8))
@@ -24,7 +27,7 @@ overlong_buffer_len=$((1024 * 2))
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
-loss_mode="kl_cov"
+loss_mode="clip_cov"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
@@ -35,23 +38,23 @@ n_resp_per_prompt=8
 max_token=30720
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:6380"}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-4}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"/data/local_disk0/wuyu/model/qwen/Qwen2.5-7B"}
-CKPTS_DIR=${CKPTS_DIR:-"/data/local_disk0/wuyu/BNTO"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/wuyu/BNTO/BNTO_verl/data/train_set/dapo-math-modified.parquet"}
-TEST_FILE=${TEST_FILE:-["/home/wuyu/BNTO/BNTO_verl/data/test_set/omni-math.parquet"]}
+MODEL_PATH=${MODEL_PATH:-"/YOUR_MODELPATH"}
+CKPTS_DIR=${CKPTS_DIR:-"/YOUR_CKPTS_PATH"}
+TRAIN_FILE=${TRAIN_FILE:-"/YOUR_TRAIN_FILE_PATH"}
+TEST_FILE=${TEST_FILE:-["/YOUR_TRAIN_FILE_PATH"]}
 
 # Algorithm
 temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 ppo_kl_coef=1
-kl_cov_ratio=0.002
+kl_cov_ratio=0.2
 
 # Mathematically equivalent
 use_dynamic_bsz=True
@@ -77,8 +80,9 @@ HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
-    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio} \
-    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${ppo_kl_coef} \
+    actor_rollout_ref.actor.policy_loss.clip_cov_ratio=${clip_cov_ratio} \
+    actor_rollout_ref.actor.policy_loss.clip_cov_lb=${clip_cov_lb} \
+    actor_rollout_ref.actor.policy_loss.clip_cov_ub=${clip_cov_ub} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.mode=sync \
     algorithm.adv_estimator=${adv_estimator} \
@@ -128,7 +132,7 @@ HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
-    trainer.logger='["console","swanlab"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=8 \

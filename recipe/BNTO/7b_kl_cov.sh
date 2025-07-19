@@ -5,9 +5,18 @@ export SWANLAB_API_KEY=YOUR_WANDB_API_KEY
 # export VLLM_USE_V1=1
 
 project_name='Qwen2.5-7B-test'
-exp_name='klcov'
+exp_name='dual_game'
 
 adv_estimator=grpo
+
+# Dual-Game specific hyperparameters
+lambda_coef=0.0          # λ initial value
+lambda_target=5.0        # Entropy budget B0
+lambda_lr=0.05           # λ learning rate
+decay_rate=0.999         # Entropy budget decay
+beta_lr=0.01             # β learning rate
+target_kl=0.1            # Target KL D
+gamma=0.8                # Dual-game γ
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -24,7 +33,7 @@ overlong_buffer_len=$((1024 * 2))
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
-loss_mode="kl_cov"
+loss_mode="dual_game"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
@@ -34,10 +43,12 @@ train_prompt_mini_bsz=32
 n_resp_per_prompt=8
 max_token=30720
 
+
+
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:6380"}
-WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
+# RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:6380"}
+# WORKING_DIR=${WORKING_DIR:-"${PWD}"}
+# RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-2}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
@@ -77,8 +88,17 @@ HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
-    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio} \
-    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${ppo_kl_coef} \
+    +actor_rollout_ref.actor.policy_loss.dual_game.gamma=${gamma} \
+    +actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef=${lambda_coef} \
+    +actor_rollout_ref.actor.policy_loss.dual_game.beta_coef=${kl_coef} \
+    +entropy_budget.target=${lambda_target} \
+    +entropy_budget.lambda_init=${lambda_coef} \
+    +entropy_budget.lambda_lr=${lambda_lr} \
+    +entropy_budget.decay_rate=${decay_rate} \
+    +critic.kl_ctrl.type=linear \
+    +critic.kl_ctrl.kl_coef=${kl_coef} \
+    +critic.kl_ctrl.target_kl=${target_kl} \
+    +critic.kl_ctrl.beta_lr=${beta_lr} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.mode=sync \
     algorithm.adv_estimator=${adv_estimator} \

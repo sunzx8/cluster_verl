@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-export SWANLAB_API_KEY=YOUR_WANDB_API_KEY
+export WANDB_API_KEY=YOUR_WANDB_API_KEY
 # export VLLM_USE_V1=1
 
-project_name='Qwen2.5-7B-test'
+project_name='Qwen2.5-32B'
 exp_name='klcov'
 
 adv_estimator=grpo
@@ -32,26 +32,26 @@ train_prompt_bsz=256
 gen_prompt_bsz=$((train_prompt_bsz * 3))
 train_prompt_mini_bsz=32
 n_resp_per_prompt=8
-max_token=30720
+max_token=20480
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:6380"}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-4}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"/data/local_disk0/wuyu/model/qwen/Qwen2.5-7B"}
-CKPTS_DIR=${CKPTS_DIR:-"/data/local_disk0/wuyu/BNTO"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/wuyu/BNTO/BNTO_verl/data/train_set/dapo-math-modified.parquet"}
-TEST_FILE=${TEST_FILE:-["/home/wuyu/BNTO/BNTO_verl/data/test_set/omni-math.parquet"]}
+MODEL_PATH=${MODEL_PATH:-"/YOUR_MODELPATH"}
+CKPTS_DIR=${CKPTS_DIR:-"/YOUR_CKPTS_PATH"}
+TRAIN_FILE=${TRAIN_FILE:-"/YOUR_TRAIN_FILE_PATH"}
+TEST_FILE=${TEST_FILE:-["/YOUR_TRAIN_FILE_PATH"]}
 
 # Algorithm
 temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 ppo_kl_coef=1
-kl_cov_ratio=0.002
+kl_cov_ratio=0.0002
 
 # Mathematically equivalent
 use_dynamic_bsz=True
@@ -76,6 +76,7 @@ HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    actor_rollout_ref.actor.loss_mode=${loss_mode} \
     actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
     actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio} \
     actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${ppo_kl_coef} \
@@ -128,7 +129,7 @@ HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
     reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
-    trainer.logger='["console","swanlab"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=8 \
