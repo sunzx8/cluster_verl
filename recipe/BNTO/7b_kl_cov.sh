@@ -70,7 +70,7 @@ infer_micro_batch_size=null
 train_micro_batch_size=null
 offload=False
 
-HYDRA_FULL_ERROR=1 python -m recipe.entropy.main_entropy \
+HYDRA_FULL_ERROR=1 python -m recipe.BNTO.main_entropy \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \

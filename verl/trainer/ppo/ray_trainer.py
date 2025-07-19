@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Optional
+import logging
+logger = logging.getLogger(__name__)      # 放在所有代码之前
+logger.setLevel(logging.INFO)
 
 import numpy as np
 import ray
@@ -336,7 +339,7 @@ class RayPPOTrainer:
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to "cuda".
         """
-
+        logger.info("Using ray trainer000000000000000000000")    
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor
@@ -393,9 +396,10 @@ class RayPPOTrainer:
             self.entropy_ctrl = None
 
         # Initialize beta (KL) controller for dual-game RL, independent of reward-KL path
-        if hasattr(self.config, 'dual_game'):
+        if hasattr(self.config, 'critic'):
             from verl.trainer.ppo.core_algos import get_kl_controller
-            self.beta_ctrl = get_kl_controller(self.config.dual_game)
+            logger.info("Using dual-game policy loss", self.config.critic.kl_ctrl)
+            self.beta_ctrl = get_kl_controller(self.config.critic.kl_ctrl)
         else:
             self.beta_ctrl = None
 
@@ -1351,9 +1355,10 @@ class RayPPOTrainer:
                                 # ----- 计算 KL, 更新 beta_ctrl -----
                                 if self.beta_ctrl is not None:
                                     import torch
+                                    current_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                     kld_mat = core_algos.kl_penalty(
                                         batch.batch["old_log_probs"],
-                                        batch.batch["ref_log_prob"],
+                                        current_log_prob,
                                         kl_penalty="low_var_kl",
                                     )
                                     kld_value = torch.mean(kld_mat * resp_mask).item()

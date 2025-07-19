@@ -31,7 +31,9 @@ import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
 
 POLICY_LOSS_REGISTRY = {}
-
+import logging
+logger = logging.getLogger(__name__)      # 放在所有代码之前
+logger.setLevel(logging.INFO)
 
 def register_policy_loss(name):
     """Register a policy loss function with the given name.
@@ -217,6 +219,7 @@ class EntropyBudgetController:
         self.target = target      # current entropy budget B
         self.lambda_lr = lambda_lr
         self.decay_rate = decay_rate
+        logger.info("Using entropy budget controller", self.value, self.target, self.lambda_lr, self.decay_rate)
 
     def update(self, current_wH_sum):
         """Update lambda coefficient based on current weighted entropy sum.
@@ -254,6 +257,7 @@ def get_kl_controller(kl_ctrl):
         # Support both new naming (beta_init/beta_lr) and fallback to kl_coef if provided
         init_beta = getattr(kl_ctrl, "beta_init", getattr(kl_ctrl, "kl_coef", 0.0))
         beta_lr = getattr(kl_ctrl, "beta_lr", 0.01)
+        logger.info("Using linear KL controller", init_beta, beta_lr)
         return LinearKLController(init_beta=init_beta, target_kl=kl_ctrl.target_kl, beta_lr=beta_lr)
     else:
         raise NotImplementedError
@@ -1243,6 +1247,7 @@ def compute_policy_loss_dual_game(
     Returns:
         tuple: (pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower)
     """
+    logger.info("Using dual-game policy loss")
     if config is None:
         raise ValueError("config is required for dual_game loss")
     
