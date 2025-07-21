@@ -35,6 +35,8 @@ from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_b
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.single_controller.base.decorator import register, Dispatch
+from omegaconf import OmegaConf
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -364,7 +366,7 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
-        if self.config.use_kl_loss:
+        if self.config.use_kl_loss or self.config.policy_loss.loss_mode == "dual_game":
             select_keys.append("ref_log_prob")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -417,6 +419,17 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    import os
+                    import socket
+                    node_id = os.environ.get('RAY_NODE_ID', 'unknown')
+                    hostname = socket.gethostname()
+                    rank = os.environ.get('RANK', 'unknown')
+                    logger.info(f"=== LOSS MODE DEBUG ===")
+                    logger.info(f"Node: {hostname}, NodeID: {node_id}, Rank: {rank}")
+                    logger.info(f"loss_mode: {loss_mode}")
+                    logger.info(f"self.config.policy_loss.loss_mode: {self.config.policy_loss.loss_mode}")
+                    logger.info(f"type of loss_mode: {type(loss_mode)}")
+                    logger.info(f"loss_mode == 'dual_game': {loss_mode == 'dual_game'}")
 
                     if self.config.policy_loss.loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -431,10 +444,22 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=loss_agg_mode,
                         )
                     elif self.config.policy_loss.loss_mode == "dual_game":
-                        logger.info("Using dual-game policy loss")
+                        logger.info("Using dual-game policy loss111111")
+                        # 打印相关的配置部分
+                        dual_game_config = self.config.policy_loss.dual_game
+                        logger.info(f"dual_game config: {OmegaConf.to_yaml(dual_game_config)}")
+                        logger.info(f"lambda_coef: {self.config.policy_loss.dual_game.lambda_coef}")
+                        logger.info(f"beta_coef: {self.config.policy_loss.dual_game.beta_coef}")
+                        logger.info(f"config type: {type(self.config)}")
+                        logger.info(f"dual_game config type: {type(dual_game_config)}")
+                        logger.info(f"=== BEFORE CALLING compute_policy_loss_dual_game ===")
+                        logger.info(f"self.config.policy_loss.dual_game.lambda_coef: {self.config.policy_loss.dual_game.lambda_coef}")
+                        logger.info(f"self.config.policy_loss.dual_game.beta_coef: {self.config.policy_loss.dual_game.beta_coef}")
+                        ref_log_prob = model_inputs["ref_log_prob"]
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_dual_game(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
+                            ref_log_prob=ref_log_prob,
                             advantages=advantages,
                             response_mask=response_mask,
                             loss_agg_mode=loss_agg_mode,
@@ -495,6 +520,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         return metrics
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
         """Update loss coefficients for dual-game RL.
         
@@ -502,13 +528,38 @@ class DataParallelPPOActor(BasePPOActor):
             lambda_coef (float, optional): Lambda coefficient for entropy penalty
             kl_coef (float, optional): Beta coefficient for KL penalty
         """
+        import os
+        import socket
+        node_id = os.environ.get('RAY_NODE_ID', 'unknown')
+        hostname = socket.gethostname()
+        rank = os.environ.get('RANK', 'unknown')
+        print(f"[DataParallelPPOActor.set_loss_coefficients] Node: {hostname}, NodeID: {node_id}, Rank: {rank}")
+        print(f"[DataParallelPPOActor.set_loss_coefficients] Received: lambda_coef={lambda_coef}, kl_coef={kl_coef}")
+        print(f"[DataParallelPPOActor.set_loss_coefficients] THIS IS THE ACTUAL ACTOR METHOD!")
+        logger.info(f"[set_loss_coefficients] Node: {hostname}, NodeID: {node_id}, Rank: {rank}")
+        logger.info(f"[set_loss_coefficients] Received: lambda_coef={lambda_coef}, kl_coef={kl_coef}")
         if lambda_coef is not None:
             if not hasattr(self.config.policy_loss, 'dual_game'):
-                from omegaconf import DictConfig
-                self.config.policy_loss.dual_game = DictConfig({})
-            self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+                from omegaconf import DictConfig,open_dict
+                with open_dict(self.config.policy_loss):
+                    self.config.policy_loss.dual_game = DictConfig({})
+            from omegaconf import open_dict
+            with open_dict(self.config.policy_loss.dual_game):
+                self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+            actual_value = self.config.policy_loss.dual_game.lambda_coef
+            logger.info(f"[set_loss_coefficients] lambda_coef updated to: {actual_value}")
+            logger.info(f"[set_loss_coefficients] config.policy_loss.dual_game.lambda_coef: {self.config.policy_loss.dual_game.lambda_coef}")
         if kl_coef is not None:
             if not hasattr(self.config.policy_loss, 'dual_game'):
-                from omegaconf import DictConfig
-                self.config.policy_loss.dual_game = DictConfig({})
-            self.config.policy_loss.dual_game.beta_coef = float(kl_coef)
+                from omegaconf import DictConfig,open_dict
+                with open_dict(self.config.policy_loss):
+                    self.config.policy_loss.dual_game = DictConfig({})
+            from omegaconf import open_dict
+            with open_dict(self.config.policy_loss.dual_game):
+                self.config.policy_loss.dual_game.beta_coef = float(kl_coef)
+            actual_value = self.config.policy_loss.dual_game.beta_coef
+            logger.info(f"[set_loss_coefficients] beta_coef updated to: {actual_value}")
+            logger.info(f"[set_loss_coefficients] config.policy_loss.dual_game.beta_coef: {self.config.policy_loss.dual_game.beta_coef}")
+        
+        # 打印完整的 dual_game 配置
+        logger.info(f"[set_loss_coefficients] Final dual_game config: {OmegaConf.to_yaml(self.config.policy_loss.dual_game)}")

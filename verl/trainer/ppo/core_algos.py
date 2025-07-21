@@ -181,21 +181,70 @@ class LinearKLController:
         init_beta (float): Initial β coefficient.
         target_kl (float): Desired KL divergence D.
         beta_lr   (float): Learning rate αβ for the dual update.
+        adaptive_enabled (bool): Whether to enable adaptive target KL (default: True)
+        adaptive_window (int): Window size for adaptive target KL calculation (default: 10)
     """
 
-    def __init__(self, init_beta: float, target_kl: float, beta_lr: float):
+    def __init__(self, init_beta: float, target_kl: float, beta_lr: float, 
+                 adaptive_enabled: bool = True, adaptive_window: int = 10):
         self.value = init_beta
         self.target = target_kl
+        self.initial_target = target_kl  # Store initial target for reference
         self.beta_lr = beta_lr
+        
+        # Adaptive target KL parameters
+        self.adaptive_enabled = adaptive_enabled
+        self.adaptive_window = adaptive_window
+        self.kl_history = []  # Store KL values for adaptive calculation
+        self.step_count = 0
+        
+        logger.info(f"Using linear KL controller: value={self.value}, target={self.target}, beta_lr={self.beta_lr}")
+        if self.adaptive_enabled:
+            logger.info(f"Adaptive target KL enabled with window size: {self.adaptive_window}")
 
     def update(self, current_kl: float, n_steps: int = 1):
-        """Additive dual update.
+        """Additive dual update with adaptive target KL.
 
         β ← [ β + αβ (D_kl − D) ]_{+}
         """
+        print(f"update beta: {self.value}")
+        print(f"update beta: {self.target}")
+        print(f"update beta: {current_kl}")
+        
+        # Update adaptive target KL based on history
+        if self.adaptive_enabled:
+            self._update_adaptive_target_kl(current_kl)
+        
         delta = self.beta_lr * (current_kl - self.target)
-        self.value = max(0.0, self.value + delta)
+        self.value = max(1e-6, self.value + delta)  # Add lower bound protection
+        print(f"update beta: {self.value}")
+        
+        # Increment step counter
+        self.step_count += 1
 
+    def _update_adaptive_target_kl(self, current_kl: float):
+        """Update adaptive target KL based on historical KL values.
+        
+        Args:
+            current_kl (float): Current KL divergence value
+        """
+        # Add current KL to history
+        self.kl_history.append(current_kl)
+        
+        # Keep only the last adaptive_window values
+        if len(self.kl_history) > self.adaptive_window:
+            self.kl_history = self.kl_history[-self.adaptive_window:]
+        
+        # Update target KL based on average of last adaptive_window steps
+        if len(self.kl_history) >= self.adaptive_window:
+            avg_kl = sum(self.kl_history) / len(self.kl_history)
+            # Set target KL to the average KL with a small margin
+            margin = 0.1  # 10% margin to ensure target is slightly higher than average
+            self.target = avg_kl * (1 + margin)
+            print(f"Adaptive target KL update: avg_kl={avg_kl:.4f}, new_target={self.target:.4f}")
+        else:
+            # During warmup, keep using initial target
+            print(f"Adaptive target KL warmup: step={len(self.kl_history)}/{self.adaptive_window}, target={self.target:.4f}")
 
 class EntropyBudgetController:
     """
@@ -204,35 +253,109 @@ class EntropyBudgetController:
     Manages the lambda coefficient and entropy budget B according to:
     lambda <- [lambda + alpha_lambda * (B - sum(w_t * H_t))]_+
     B <- B0 * exp(-alpha * step / T)
+    
+    Adaptive B_t: Uses average of last 10 steps to set per-token budget
     """
 
-    def __init__(self, target, lambda_init=0.0, lambda_lr=0.05, decay_rate=0.999):
+    def __init__(self, target, lambda_init=0.0, lambda_lr=0.05, alpha=0.001, total_steps=1000, 
+                 adaptive_window=10, adaptive_enabled=True):
         """Initialize entropy budget controller.
         
         Args:
-            target (float): Initial entropy budget B0
+            target (float): Initial entropy budget B0 (per-token budget B_t)
             lambda_init (float): Initial lambda coefficient
             lambda_lr (float): Learning rate for lambda updates (alpha_lambda)
-            decay_rate (float): Decay rate for entropy budget (exp(-alpha/T) approximation)
+            alpha (float): Decay rate parameter for entropy budget
+            total_steps (int): Total training steps T
+            adaptive_window (int): Window size for adaptive B_t calculation (default: 10)
+            adaptive_enabled (bool): Whether to enable adaptive B_t (default: True)
         """
         self.value = lambda_init  # lambda coefficient
-        self.target = target      # current entropy budget B
+        self.B0 = target         # Initial entropy budget B0 (adaptive target)
+        self.target = target      # current per-token entropy budget B_t(step)
+        self.initial_target = target  # B0 for decay calculation
         self.lambda_lr = lambda_lr
-        self.decay_rate = decay_rate
-        logger.info("Using entropy budget controller", self.value, self.target, self.lambda_lr, self.decay_rate)
+        self.alpha = alpha
+        self.total_steps = total_steps
+        
+        # Adaptive B_t parameters
+        self.adaptive_enabled = adaptive_enabled
+        self.adaptive_window = adaptive_window
+        self.wH_history = []  # Store wH_sum / token_count for adaptive calculation
+        
+        logger.info(f"Using entropy budget controller: value={self.value}, B0={self.B0}, lambda_lr={self.lambda_lr}, alpha={self.alpha}, total_steps={self.total_steps}")
+        if self.adaptive_enabled:
+            logger.info(f"Adaptive B0 enabled with window size: {self.adaptive_window}")
 
-    def update(self, current_wH_sum):
+    def update(self, current_wH_sum, token_count=None):
         """Update lambda coefficient based on current weighted entropy sum.
         
         Args:
             current_wH_sum (float): Current sum of w_t * H_t
+            token_count (int, optional): Number of tokens for dynamic budget calculation
         """
         # lambda <- [lambda + alpha_lambda * (B - sum(w_t * H_t))]_+
-        self.value = max(0.0, self.value + self.lambda_lr * (self.target - current_wH_sum))
+        print(f"update lambda: {self.value}")
+        print(f"update lambda: {self.target}")
+        print(f"update lambda: {current_wH_sum}")
+        
+        # Calculate dynamic total budget: B = B_t * T where B_t is per-token budget
+        if token_count is not None and token_count > 0:
+            # Calculate per-token weighted entropy for adaptive B_t
+            wH_per_token = current_wH_sum / token_count
+            
+            # Update adaptive B_t based on history
+            if self.adaptive_enabled:
+                self._update_adaptive_b_t(wH_per_token)
+            
+            # self.target is B_t (per-token budget), calculate total budget B = B_t * T
+            total_budget = self.target * token_count
+            print(f"update lambda: B_t: {self.target}, token_count: {token_count}, total_budget: {total_budget}")
+            print(f"update lambda: wH_per_token: {wH_per_token}")
+        else:
+            error_msg = "token_count is None or <= 0"
+            raise ValueError(error_msg)
+        
+        self.value = max(1e-6, self.value + self.lambda_lr * (total_budget - current_wH_sum))  # Add lower bound protection
+        print(f"update lambda: {self.value}")
+        
 
-    def decay_target(self):
-        """Decay the entropy budget target: B <- B * decay_rate"""
-        self.target *= self.decay_rate
+
+    def _update_adaptive_b_t(self, wH_per_token):
+        """Update adaptive initial budget B0 based on historical wH_per_token values.
+        
+        Args:
+            wH_per_token (float): Current weighted entropy per token
+        """
+        # Add current wH_per_token to history
+        self.wH_history.append(wH_per_token)
+        
+        # Keep only the last adaptive_window values
+        if len(self.wH_history) > self.adaptive_window:
+            self.wH_history = self.wH_history[-self.adaptive_window:]
+        
+        # Update B0 based on average of last adaptive_window steps
+        if len(self.wH_history) >= self.adaptive_window:
+            avg_wH_per_token = sum(self.wH_history) / len(self.wH_history)
+            # Set B0 to the average wH_per_token with a small margin
+            margin = 0.1  # 10% margin to ensure budget is slightly higher than average
+            self.B0 = avg_wH_per_token * (1 + margin)
+            print(f"Adaptive B0 update: avg_wH_per_token={avg_wH_per_token:.4f}, new_B0={self.B0:.4f}")
+        else:
+            # During warmup, keep using initial B0
+            print(f"Adaptive B0 warmup: step={len(self.wH_history)}/{self.adaptive_window}, B0={self.B0:.4f}")
+
+    def decay_target(self, current_step):
+        """Decay the entropy budget target: B_t(step) = (B0 / T) * exp(-alpha * step / T)
+        
+        Args:
+            current_step (int): Current training step
+        """
+        print(f"decay lambda: B0={self.B0}, alpha={self.alpha}, step={current_step}, T={self.total_steps}")
+        # Calculate B_t(step) = (B0 / T) * exp(-alpha * step / T)
+        exp_arg = torch.tensor(-self.alpha * current_step / self.total_steps)
+        self.target = (self.B0 / self.total_steps) * torch.exp(exp_arg).item()
+        print(f"decay lambda: B_t(step)={self.target}")
 
 
 def get_kl_controller(kl_ctrl):
@@ -257,8 +380,17 @@ def get_kl_controller(kl_ctrl):
         # Support both new naming (beta_init/beta_lr) and fallback to kl_coef if provided
         init_beta = getattr(kl_ctrl, "beta_init", getattr(kl_ctrl, "kl_coef", 0.0))
         beta_lr = getattr(kl_ctrl, "beta_lr", 0.01)
-        logger.info("Using linear KL controller", init_beta, beta_lr)
-        return LinearKLController(init_beta=init_beta, target_kl=kl_ctrl.target_kl, beta_lr=beta_lr)
+        # Extract adaptive parameters with defaults
+        adaptive_enabled = getattr(kl_ctrl, "adaptive_enabled", True)
+        adaptive_window = getattr(kl_ctrl, "adaptive_window", 10)
+        logger.info(f"Using linear KL controller: init_beta={init_beta}, beta_lr={beta_lr}")
+        return LinearKLController(
+            init_beta=init_beta, 
+            target_kl=kl_ctrl.target_kl, 
+            beta_lr=beta_lr,
+            adaptive_enabled=adaptive_enabled,
+            adaptive_window=adaptive_window
+        )
     else:
         raise NotImplementedError
 
@@ -1221,10 +1353,10 @@ def compute_pf_ppo_reweight_data(
     return resampled_data
 
 
-@register_policy_loss("dual_game")
 def compute_policy_loss_dual_game(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
+    ref_log_prob: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
@@ -1258,6 +1390,9 @@ def compute_policy_loss_dual_game(
     
     # Get beta from dual_game beta coefficient (trainer will update each batch)
     beta_coef = dual_game_config.get("beta_coef", 0.0)
+    logger.info(f"gamma: {gamma}")
+    logger.info(f"lambda_coef: {lambda_coef}")
+    logger.info(f"beta_coef: {beta_coef}")
     
     # Get clipping parameters
     cliprange = config.clip_ratio
@@ -1267,29 +1402,32 @@ def compute_policy_loss_dual_game(
     # Compute modified advantages: Â⁺ + γÂ⁻
     adv_positive = torch.clamp(advantages, min=0.0)
     adv_negative = torch.clamp(advantages, max=0.0)
-    adv_modified = adv_positive + gamma * adv_negative
+    adv_base = adv_positive + gamma * adv_negative
+
+    # Compute entropy penalty: λw_t(−logp−1)
+    prob = torch.exp(log_prob)
+    w = prob * (1 - prob) * torch.abs(advantages)  # w_t = p_t(1−p_t)|Â_t|
+    entropy_penalty = lambda_coef * w * (-log_prob - 1)
+
+    # Compute KL penalty: β(logp−logp₀) using reference policy
+    kl_penalty = beta_coef * (log_prob - ref_log_prob)
+
+    #Combine all terms into modified advantage 
+    # Modified advantage = [(Â⁺ + γÂ⁻) − λw_t(−logp−1) − β(logp−logp₀)]
+    adv_modified = adv_base - entropy_penalty - kl_penalty
+
     
     # Compute standard PPO clipped loss with modified advantages
-    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = log_prob - old_log_prob  # For PPO ratio calculation
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     
     pg_losses1 = -adv_modified * ratio
     pg_losses2 = -adv_modified * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
     
-    clip_pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     
-    # Compute entropy penalty: λw_t(−logp−1)
-    prob = torch.exp(log_prob)
-    w = prob * (1 - prob) * torch.abs(advantages)  # w_t = p_t(1−p_t)|Â_t|
-    entropy_penalty = lambda_coef * w * (-log_prob - 1)
-    
-    # Compute KL penalty: β(logp−logp₀)
-    kl_penalty = beta_coef * (log_prob - old_log_prob)
-    
-    # Combine all terms
-    pg_losses = clip_pg_losses + entropy_penalty + kl_penalty
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     
     return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)

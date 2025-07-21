@@ -141,9 +141,9 @@ class TaskRunner:
             mapping[Role.RewardModel] = global_pool_id
 
         # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[Role.RefPolicy] = global_pool_id
+        
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        mapping[Role.RefPolicy] = global_pool_id
 
         reward_kwargs = {
             "max_resp_len": config.data.max_response_length,

@@ -48,6 +48,7 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import broadcast_dict_tensor
 from verl.workers.actor import BasePPOActor
+from verl.single_controller.base.decorator import register, Dispatch
 
 __all__ = ["MegatronPPOActor"]
 
@@ -657,6 +658,7 @@ class MegatronPPOActor(BasePPOActor):
         get_torch_device().empty_cache()
         return metrics
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
         """Update loss coefficients for dual-game RL.
         
@@ -664,13 +666,26 @@ class MegatronPPOActor(BasePPOActor):
             lambda_coef (float, optional): Lambda coefficient for entropy penalty
             kl_coef (float, optional): Beta coefficient for KL penalty
         """
+        print(f"[MegatronPPOActor.set_loss_coefficients] Received: lambda_coef={lambda_coef}, kl_coef={kl_coef}")
+        print(f"[MegatronPPOActor.set_loss_coefficients] THIS IS THE ACTUAL ACTOR METHOD!")
+        logger.info(f"[set_loss_coefficients] Received: lambda_coef={lambda_coef}, kl_coef={kl_coef}")
         if lambda_coef is not None:
             if not hasattr(self.config.policy_loss, 'dual_game'):
-                from omegaconf import DictConfig
-                self.config.policy_loss.dual_game = DictConfig({})
-            self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+                from omegaconf import DictConfig, open_dict
+                with open_dict(self.config.policy_loss):
+                    self.config.policy_loss.dual_game = DictConfig({})
+            from omegaconf import open_dict
+            with open_dict(self.config.policy_loss.dual_game):
+                self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+            actual_value = self.config.policy_loss.dual_game.lambda_coef
+            logger.info(f"[set_loss_coefficients] lambda_coef updated to: {actual_value}")
         if kl_coef is not None:
             if not hasattr(self.config.policy_loss, 'dual_game'):
-                from omegaconf import DictConfig
-                self.config.policy_loss.dual_game = DictConfig({})
-            self.config.policy_loss.dual_game.beta_coef = float(kl_coef)
+                from omegaconf import DictConfig, open_dict
+                with open_dict(self.config.policy_loss):
+                    self.config.policy_loss.dual_game = DictConfig({})
+            from omegaconf import open_dict
+            with open_dict(self.config.policy_loss.dual_game):
+                self.config.policy_loss.dual_game.beta_coef = float(kl_coef)
+            actual_value = self.config.policy_loss.dual_game.beta_coef
+            logger.info(f"[set_loss_coefficients] beta_coef updated to: {actual_value}")

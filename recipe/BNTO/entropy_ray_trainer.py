@@ -244,14 +244,14 @@ class RayEntropyTrainer(RayPPOTrainer):
                                 }
                             )
 
-                    #if self.use_reference_policy: 
+                    if self.use_reference_policy:
                         # compute reference log_prob
-                    with marked_timer("ref", timing_raw, color="olive"):
-                        if not self.ref_in_actor:
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                        else:
-                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                        batch = batch.union(ref_log_prob)
+                        with marked_timer("ref", timing_raw, color="olive"):
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            else:
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
 
                     # compute values
                     if self.use_critic:
@@ -309,22 +309,28 @@ class RayEntropyTrainer(RayPPOTrainer):
                             self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dual_game"):
                             
                             with marked_timer("dual_game_update", timing_raw, color="purple"):
-                                # Compute weighted entropy sum: Σ w_t H_t
+                                # Compute weighted entropy sum: Σ w_t H_t with per-token budget B_t = B/T
                                 resp_mask = batch.batch["response_mask"]
                                 adv = batch.batch["advantages"] 
                                 logp = batch.batch["old_log_probs"]
                                 prob = torch.exp(logp)
                                 H = -(prob * logp)  # entropy H_t = -p_t * log p_t
                                 w = prob * (1 - prob) * torch.abs(adv)  # w_t = p_t(1-p_t)|Â_t|
-                                wH_sum = torch.sum(w * H * resp_mask).item()
                                 
-                                # Update lambda and entropy budget
-                                self.entropy_ctrl.update(wH_sum)
-                                self.entropy_ctrl.decay_target()
+                                # Calculate total weighted entropy sum
+                                wH_sum = torch.sum(w * H * resp_mask)
+                                token_count = torch.sum(resp_mask)  # T = number of valid tokens
+                                print(f"wH_sum: {wH_sum.item()}, token_count: {token_count.item()}")
+                                print(f"Average wH per token: {wH_sum.item() / token_count.item() if token_count.item() > 0 else 0}")
+                                print(f"Total budget B = B_t * token_count = {self.entropy_ctrl.target} * {token_count.item()} = {self.entropy_ctrl.target * token_count.item()}")
+                                
+                                # Update lambda and entropy budget with total sum
+                                self.entropy_ctrl.update(wH_sum.item(), token_count.item())
+                                self.entropy_ctrl.decay_target(self.global_steps)
                                 log_prob = batch.batch["old_log_probs"]
+                                print(f"log_prob: {log_prob}")
                                 # ----- 计算 KL, 更新 beta_ctrl -----
                                 if self.beta_ctrl is not None:
-                                    
                                     # 计算当前策略和旧策略之间的 KL 散度
                                     kld_mat = core_algos.kl_penalty(
                                         batch.batch["old_log_probs"],
@@ -332,8 +338,9 @@ class RayEntropyTrainer(RayPPOTrainer):
                                         kl_penalty="low_var_kl",
                                     )
                                     kld_value = torch.mean(kld_mat * resp_mask).item()
-                                    self.beta_ctrl.update(current_kl=kld_value, n_steps=batch.batch_size[0])
+                                    self.beta_ctrl.update(current_kl=kld_value, n_steps=len(batch))
                                     beta_val = self.beta_ctrl.value
+                                    print(f"beta_val: {beta_val}")
                                 else:
                                     kld_value = 0.0
                                     beta_val = 0.0
@@ -347,6 +354,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                 self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = self.entropy_ctrl.value
 
                                 # 广播 λ、β 到 Actor
+                                print(f"222222332323232323232323Broadcasting lambda and beta to Actor: {self.entropy_ctrl.value}, {beta_val}")
                                 self.actor_rollout_wg.execute_all_sync(
                                     "set_loss_coefficients",
                                     lambda_coef=self.entropy_ctrl.value,

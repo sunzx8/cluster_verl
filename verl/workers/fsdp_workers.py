@@ -917,6 +917,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
         """同步 Dual-Game λ、β 系数到本 Worker 所有 rank。"""
+        print(f"fpssdfjdsfhdskjhfjdkhfskjset_loss_coefficients: {lambda_coef}, {kl_coef}")
         if self._is_actor:
             self.actor.set_loss_coefficients(lambda_coef=lambda_coef, kl_coef=kl_coef)
 

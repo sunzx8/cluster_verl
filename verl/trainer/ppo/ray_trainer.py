@@ -388,10 +388,32 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         
-        # Initialize entropy budget controller for dual-game RL
+        # Initialize entropy budget controller for dual-game RL after total_training_steps is calculated
         if hasattr(self.config, 'entropy_budget'):
             from verl.trainer.ppo.core_algos import EntropyBudgetController
-            self.entropy_ctrl = EntropyBudgetController(**self.config.entropy_budget)
+            # Extract parameters with proper defaults
+            target = self.config.entropy_budget.get('target', 5.0)
+            lambda_init = self.config.entropy_budget.get('lambda_init', 0.0)
+            lambda_lr = self.config.entropy_budget.get('lambda_lr', 0.05)
+            alpha = self.config.entropy_budget.get('alpha', 0.001)
+            max_lambda = self.config.entropy_budget.get('max_lambda', 10.0)
+            wH_clip_range = self.config.entropy_budget.get('wH_clip_range', [0.0, 10.0])
+            # Use actual total training steps
+            total_steps = self.total_training_steps
+            
+            # Extract adaptive parameters with defaults
+            adaptive_enabled = self.config.entropy_budget.get('adaptive_enabled', True)
+            adaptive_window = self.config.entropy_budget.get('adaptive_window', 10)
+            
+            self.entropy_ctrl = EntropyBudgetController(
+                target=target,
+                lambda_init=lambda_init,
+                lambda_lr=lambda_lr,
+                alpha=alpha,
+                total_steps=total_steps,
+                adaptive_enabled=adaptive_enabled,
+                adaptive_window=adaptive_window
+            )
         else:
             self.entropy_ctrl = None
 
@@ -1350,7 +1372,7 @@ class RayPPOTrainer:
                                 
                                 # Update lambda and entropy budget
                                 self.entropy_ctrl.update(wH_sum)
-                                self.entropy_ctrl.decay_target()
+                                self.entropy_ctrl.decay_target(self.global_steps)
                                 
                                 # ----- 计算 KL, 更新 beta_ctrl -----
                                 if self.beta_ctrl is not None:

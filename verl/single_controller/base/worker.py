@@ -299,3 +299,53 @@ class Worker(WorkerHelper):
         """
         result = func(*args, **kwargs)
         return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_loss_coefficients(self, lambda_coef=None, kl_coef=None):
+        """
+        Dual-Game 专用。更新配置中的 lambda_coef 和 beta_coef。
+        """
+        print(f"set_loss_coefficients called on {self.__class__.__name__}, lambda_coef={lambda_coef}, kl_coef={kl_coef}")
+        
+        # 如果是 WorkerDict，转发给实际的 Actor 实例
+        if hasattr(self, 'worker_dict') and self.worker_dict:
+            # 找到包含 'actor' 的 worker
+            for key, worker in self.worker_dict.items():
+                if 'actor' in key.lower():
+                    print(f"Forwarding set_loss_coefficients to {key} worker")
+                    return worker.set_loss_coefficients(lambda_coef=lambda_coef, kl_coef=kl_coef)
+        
+        # 如果不是 WorkerDict 或者没有找到 actor，直接更新自己的配置
+        # 存储系数值用于调试和跟踪
+        if lambda_coef is not None:
+            self.lambda_coef = lambda_coef
+        if kl_coef is not None:
+            self.kl_coef = kl_coef
+        
+        # 更新配置中的 dual_game 参数
+        if hasattr(self, 'config') and self.config is not None:
+            try:
+                # 确保 dual_game 配置存在
+                if not hasattr(self.config.policy_loss, 'dual_game'):
+                    from omegaconf import DictConfig, open_dict
+                    with open_dict(self.config.policy_loss):
+                        self.config.policy_loss.dual_game = DictConfig({})
+                
+                # 更新 lambda_coef
+                if lambda_coef is not None:
+                    from omegaconf import open_dict
+                    with open_dict(self.config.policy_loss.dual_game):
+                        self.config.policy_loss.dual_game.lambda_coef = float(lambda_coef)
+                    print(f"[{self.__class__.__name__}] lambda_coef updated to: {lambda_coef}")
+                
+                # 更新 beta_coef
+                if kl_coef is not None:
+                    from omegaconf import open_dict
+                    with open_dict(self.config.policy_loss.dual_game):
+                        self.config.policy_loss.dual_game.beta_coef = float(kl_coef)
+                    print(f"[{self.__class__.__name__}] beta_coef updated to: {kl_coef}")
+                    
+            except Exception as e:
+                print(f"[{self.__class__.__name__}] Error updating config: {e}")
+            
+        return None
