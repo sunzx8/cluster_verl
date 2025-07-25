@@ -314,6 +314,70 @@ class RayDAPOTrainer(RayPPOTrainer):
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
+                    # BNTO Analysis: 收集诊断性统计指标
+                    with marked_timer("bnto_analysis", timing_raw, "purple"):
+                        resp_mask = batch.batch["response_mask"]
+                        old_log_probs = batch.batch["old_log_probs"]
+                        advantages = batch.batch["advantages"]
+                        token_rewards = batch.batch["token_level_rewards"]
+                        
+                        prob = torch.exp(old_log_probs)
+                        H = -(prob * old_log_probs)  # 单token熵
+                        
+                        # KL residual (如果有ref_log_probs)
+                        ref_log_probs = batch.batch.get("ref_log_probs", None)
+                        if ref_log_probs is not None:
+                            kl_residual = torch.abs(old_log_probs - ref_log_probs)
+                        else:
+                            kl_residual = torch.ones_like(old_log_probs)
+                        
+                        # 计算token重要性权重 (BNTO方式)
+                        w_basic = prob * (1 - prob) * torch.abs(advantages)  # 基础权重
+                        w_kl_gated = w_basic * kl_residual  # KL-gated权重
+                        
+                        # 各种per-token指标
+                        token_count = torch.sum(resp_mask)
+                        wH_basic = torch.sum(w_basic * H * resp_mask) / token_count
+                        wH_kl_gated = torch.sum(w_kl_gated * H * resp_mask) / token_count
+                        kl_per_token = torch.sum(kl_residual * resp_mask) / token_count
+                        # 平均熵
+                        token_entropy_mean = torch.sum(H * resp_mask) / token_count
+                        
+                        # 奖励标准差
+                        valid_rewards = token_rewards[resp_mask.bool()]
+                        reward_std = torch.std(valid_rewards).item() if len(valid_rewards) > 0 else 0.0
+                        
+                        # 预算相关 (如果有熵控制器)
+                        if hasattr(self, 'entropy_ctrl') and self.entropy_ctrl is not None:
+                            B_token = self.entropy_ctrl.target / token_count.item()
+                            lambda_val = self.entropy_ctrl.value
+                            usage_ratio_basic = wH_basic.item() / B_token
+                            usage_ratio_kl_gated = wH_kl_gated.item() / B_token
+                        else:
+                            B_token = lambda_val = usage_ratio_basic = usage_ratio_kl_gated = 0.0
+                        
+                        # KL控制器
+                        if hasattr(self, 'beta_ctrl') and self.beta_ctrl is not None:
+                            beta_val = self.beta_ctrl.value
+                        else:
+                            beta_val = 0.0
+                        
+                        # 添加分析指标到metrics
+                        analysis_metrics = {
+                            "analysis/wH_per_token_basic": wH_basic.item(),
+                            "analysis/wH_per_token_kl_gated": wH_kl_gated.item(),
+                            "analysis/B_token": B_token,
+                            "analysis/lambda": lambda_val,
+                            "analysis/beta": beta_val,
+                            "analysis/KL_per_token": kl_per_token.item(),
+                            "analysis/usage_ratio_basic": usage_ratio_basic,
+                            "analysis/usage_ratio_kl_gated": usage_ratio_kl_gated,
+                            "analysis/token_entropy_mean": token_entropy_mean.item(),
+                            "analysis/reward_std": reward_std,
+                            "analysis/token_count": token_count.item(),
+                        }
+                        metrics.update(analysis_metrics)
+
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor

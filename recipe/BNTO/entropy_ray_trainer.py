@@ -58,13 +58,67 @@ from verl.utils.debug import marked_timer
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-
+from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager, WorkerType
+from typing import Optional
 
 
 class RayEntropyTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        collate_fn=None,
+        train_sampler: Optional[Sampler] = None,
+        device_name="cuda",
+    ):
+        super().__init__(config, tokenizer, role_worker_mapping, resource_pool_manager, ray_worker_group_cls, processor, reward_fn, val_reward_fn, train_dataset, val_dataset, collate_fn, train_sampler, device_name)
+        
+        # Initialize entropy budget controller for dual-game RL after total_training_steps is calculated
+        if hasattr(self.config, 'entropy_budget'):
+            from verl.trainer.ppo.core_algos import EntropyBudgetController
+            # Extract parameters with proper defaults
+            target = self.config.entropy_budget.get('target', 5.0)
+            lambda_init = self.config.entropy_budget.get('lambda_init', 0.0)
+            lambda_lr = self.config.entropy_budget.get('lambda_lr', 0.05)
+            alpha = self.config.entropy_budget.get('alpha', 0.001)
+            max_lambda = self.config.entropy_budget.get('max_lambda', 10.0)
+            wH_clip_range = self.config.entropy_budget.get('wH_clip_range', [0.0, 10.0])
+            # Use actual total training steps
+            total_steps = self.total_training_steps
+            
+            # Extract adaptive parameters with defaults
+            adaptive_enabled = self.config.entropy_budget.get('adaptive_enabled', True)
+            adaptive_window = self.config.entropy_budget.get('adaptive_window', 10)
+            
+            self.entropy_ctrl = EntropyBudgetController(
+                target=target,
+                lambda_init=lambda_init,
+                lambda_lr=lambda_lr,
+                alpha=alpha,
+                total_steps=total_steps,
+                adaptive_enabled=adaptive_enabled,
+                adaptive_window=adaptive_window
+            )
+        else:
+            self.entropy_ctrl = None
+
+        # Initialize beta (KL) controller for dual-game RL, independent of reward-KL path
+        if hasattr(self.config, 'critic'):
+            from verl.trainer.ppo.core_algos import get_kl_controller
+            self.beta_ctrl = get_kl_controller(self.config.critic.kl_ctrl)
+        else:
+            self.beta_ctrl = None
 
     def fit(self):
         """
@@ -309,26 +363,33 @@ class RayEntropyTrainer(RayPPOTrainer):
                             self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dual_game"):
                             
                             with marked_timer("dual_game_update", timing_raw, color="purple"):
-                                # Compute weighted entropy sum: Σ w_t H_t with per-token budget B_t = B/T
+                                # 计算奖励标准差
+                                token_rewards = batch.batch["token_level_rewards"]
+                                resp_mask = batch.batch["response_mask"]
+                                valid_rewards = token_rewards[resp_mask.bool()]
+                                reward_std = torch.std(valid_rewards).item() if len(valid_rewards) > 0 else 0.0
+                                
+                                # 计算加权熵
                                 resp_mask = batch.batch["response_mask"]
                                 adv = batch.batch["advantages"] 
                                 logp = batch.batch["old_log_probs"]
                                 prob = torch.exp(logp)
-                                H = -(prob * logp)  # entropy H_t = -p_t * log p_t
-                                w = prob * (1 - prob) * torch.abs(adv)  # w_t = p_t(1-p_t)|Â_t|
+                                H = -(prob * logp)
+                                ref_logp = batch.batch.get("ref_log_probs", None)
+                                if ref_logp is not None:
+                                    kl_residual = torch.abs(logp - ref_logp)
+                                else:
+                                    kl_residual = torch.ones_like(logp)
+                                w = prob * (1 - prob) * kl_residual * torch.abs(adv)
                                 
-                                # Calculate total weighted entropy sum
                                 wH_sum = torch.sum(w * H * resp_mask)
-                                token_count = torch.sum(resp_mask)  # T = number of valid tokens
-                                print(f"wH_sum: {wH_sum.item()}, token_count: {token_count.item()}")
-                                print(f"Average wH per token: {wH_sum.item() / token_count.item() if token_count.item() > 0 else 0}")
-                                print(f"Total budget B = B_t * token_count = {self.entropy_ctrl.target} * {token_count.item()} = {self.entropy_ctrl.target * token_count.item()}")
+                                token_count = torch.sum(resp_mask)
                                 
-                                # Update lambda and entropy budget with total sum
+                                # 更新熵预算控制器（传入奖励标准差以及预算使用率）
                                 self.entropy_ctrl.update(wH_sum.item(), token_count.item())
-                                self.entropy_ctrl.decay_target(self.global_steps)
-                                log_prob = batch.batch["old_log_probs"]
-                                print(f"log_prob: {log_prob}")
+                                usage_ratio = wH_sum.item() / max(self.entropy_ctrl.target, 1e-8)
+                                self.entropy_ctrl.decay_target(self.global_steps, reward_std, usage_ratio)
+
                                 # ----- 计算 KL, 更新 beta_ctrl -----
                                 if self.beta_ctrl is not None:
                                     # 计算当前策略和旧策略之间的 KL 散度
@@ -353,7 +414,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                 self.config.actor_rollout_ref.actor.policy_loss.dual_game.beta_coef = beta_val
                                 self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = self.entropy_ctrl.value
 
-                                # 广播 λ、β 到 Actor
+                                                                # 广播 λ、β 到 Actor
                                 print(f"222222332323232323232323Broadcasting lambda and beta to Actor: {self.entropy_ctrl.value}, {beta_val}")
                                 self.actor_rollout_wg.execute_all_sync(
                                     "set_loss_coefficients",
@@ -361,15 +422,44 @@ class RayEntropyTrainer(RayPPOTrainer):
                                     kl_coef=beta_val,
                                 )
 
-                                # Log dual-game metrics
-                                dual_metrics = {
+                                
+                                # 计算额外的分析指标
+                                # KL门控加权熵
+                                w_kl_gated = w * kl_residual
+                                wH_kl_gated = torch.sum(w_kl_gated * H * resp_mask) / token_count
+                                
+                                # KL per token (使用真正的KL散度)
+                                if self.beta_ctrl is not None:
+                                    # 使用已经计算好的kld_mat
+                                    kl_per_token = torch.mean(kld_mat * resp_mask)
+                                else:
+                                    kl_per_token = torch.tensor(0.0)
+                                
+                                # 平均熵
+                                token_entropy_mean = torch.sum(H * resp_mask) / token_count
+                                
+                                # 使用率
+                                B_token = self.entropy_ctrl.target / token_count.item()
+                                usage_ratio_basic = wH_sum.item() / max(B_token, 1e-8)
+                                usage_ratio_kl_gated = wH_kl_gated.item() / max(B_token, 1e-8)
+                                
+                                # 添加分析指标（复用已有计算）
+                                dual_game_metrics = {
+                                    "dual_game/per_token_budget_Bt": self.entropy_ctrl.target / token_count.item(),
+                                    "dual_game/wH_per_token_basic": wH_sum.item() / token_count.item(),
+                                    "dual_game/wH_per_token_kl_gated": wH_kl_gated.item(),
+                                    "dual_game/B_token": B_token,
                                     "dual_game/lambda": self.entropy_ctrl.value,
-                                    "dual_game/entropy_budget": self.entropy_ctrl.target,
-                                    "dual_game/wH_sum": wH_sum,
                                     "dual_game/beta": beta_val,
-                                    "dual_game/kl": kld_value,
+                                    "dual_game/KL_per_token": kl_per_token.item(),
+                                    "dual_game/usage_ratio_basic": usage_ratio_basic,
+                                    "dual_game/usage_ratio_kl_gated": usage_ratio_kl_gated,
+                                    "dual_game/token_entropy_mean": token_entropy_mean.item(),
+                                    "dual_game/reward_std": reward_std,
+                                    "dual_game/token_count": token_count.item(),
                                 }
-                                metrics.update(dual_metrics)
+                                
+                                metrics.update(dual_game_metrics)
 
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -467,3 +557,18 @@ class RayEntropyTrainer(RayPPOTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+    def detect_entropy_collapse(self, wH_per_token, step):
+        """检测熵崩塌并自动调整"""
+        if step > 2:  # 从第3步开始检测
+            # 如果wH下降超过90%，认为发生熵崩塌
+            if wH_per_token < 0.0001:  # 阈值可调
+                print(f" ENTROPY COLLAPSE DETECTED! wH_per_token={wH_per_token:.8f}")
+                
+                # 自动调整λ和预算
+                self.entropy_ctrl.value *= 0.1  # λ减少90%
+                self.entropy_ctrl.target = max(0.001, wH_per_token * 2)  # 预算设为当前消耗的2倍
+                
+                print(f"🔧 Auto-adjustment: λ={self.entropy_ctrl.value:.6f}, B_t={self.entropy_ctrl.target:.6f}")
+                return True
+        return False

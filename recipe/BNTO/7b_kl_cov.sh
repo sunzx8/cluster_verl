@@ -11,14 +11,14 @@ adv_estimator=grpo
 
 # Dual-Game specific hyperparameters
 lambda_coef=0.0          # λ initial value
-lambda_target=0.05        # Entropy budget B0
+lambda_target=0.005        # Entropy budget B0
 lambda_lr=0.1           # λ learning rate
 decay_rate=0.999         # Entropy budget decay
 beta_lr=0.001             # β learning rate
 target_kl=0.001            # Target KL D
-gamma=0.8                # Dual-game γ
+gamma=1.5                # Dual-game γ
 
-use_kl_in_reward=True
+use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
@@ -37,9 +37,9 @@ loss_mode="dual_game"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=256
+train_prompt_bsz=64
 gen_prompt_bsz=$((train_prompt_bsz * 3))
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=64
 n_resp_per_prompt=8
 max_token=30720
 
@@ -49,7 +49,7 @@ max_token=30720
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:6380"}
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"/data/local_disk0/wuyu/model/qwen/Qwen2.5-7B"}

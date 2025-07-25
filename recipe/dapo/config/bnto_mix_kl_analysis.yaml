@@ -1,0 +1,53 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer: 
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: null
+    max_num_gen_batches: 0
+  # BNTO specific: use dual_game loss with KL gating
+  policy_loss:
+    loss_mode: dual_game
+    dual_game:
+      gamma: 1.5  # 放大负优势，与论文一致
+      lambda_coef: 0.0  # 由controller动态更新
+      beta_coef: 0.0    # 由controller动态更新
+      use_kl_gating: true  # 启用KL residual gating
+
+# 熵预算控制 (混合衰减：sigma_R + usage_ratio)
+entropy_budget:
+  target: 5.0
+  lambda_init: 0.0
+  lambda_lr: 0.05
+  budget_mix_alpha: 0.5  # 混合sigma_R与usage_ratio，各占50%
+  adaptive_enabled: false
+
+# KL控制
+critic:
+  kl_ctrl:
+    type: linear
+    beta_init: 0.0
+    beta_lr: 0.01
+    target_kl: 0.04
+    adaptive_enabled: false
+
+trainer:
+  project_name: verl-bnto-mix-kl-analysis 

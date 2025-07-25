@@ -45,13 +45,14 @@ actor_rollout_ref:
 
 # Entropy budget control configuration
 entropy_budget:
-  target: 0.05 # Per-token entropy budget B_t (based on theoretical analysis: w_t*H_t ≈ 0.051)
-  lambda_init: 0.0 # Initial lambda coefficient
-  lambda_lr: 0.1 # Learning rate for lambda updates (alpha_lambda) - increased from 0.05
-  alpha: 0.001 # Decay rate parameter for entropy budget
-  # Adaptive B_t parameters
-  adaptive_enabled: true # Enable adaptive per-token budget calculation
-  adaptive_window: 10 # Window size for adaptive B_t calculation (average of last N steps)
+  target: 5.0  # 总预算B_0（不再是per-token预算）
+  lambda_init: 0.0
+  lambda_lr: 0.1
+  alpha: 0.001
+  # 基于奖励标准差的衰减参数
+  reward_std_based_decay: true
+  warmup_steps_ratio: 0.1  # 前10%步数用于估计σ_{R,max}
+  min_budget_ratio: 0.1    # 最小预算比例
 
 
 # Critic KL control configuration

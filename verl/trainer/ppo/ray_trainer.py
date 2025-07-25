@@ -388,42 +388,6 @@ class RayPPOTrainer:
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         
-        # Initialize entropy budget controller for dual-game RL after total_training_steps is calculated
-        if hasattr(self.config, 'entropy_budget'):
-            from verl.trainer.ppo.core_algos import EntropyBudgetController
-            # Extract parameters with proper defaults
-            target = self.config.entropy_budget.get('target', 5.0)
-            lambda_init = self.config.entropy_budget.get('lambda_init', 0.0)
-            lambda_lr = self.config.entropy_budget.get('lambda_lr', 0.05)
-            alpha = self.config.entropy_budget.get('alpha', 0.001)
-            max_lambda = self.config.entropy_budget.get('max_lambda', 10.0)
-            wH_clip_range = self.config.entropy_budget.get('wH_clip_range', [0.0, 10.0])
-            # Use actual total training steps
-            total_steps = self.total_training_steps
-            
-            # Extract adaptive parameters with defaults
-            adaptive_enabled = self.config.entropy_budget.get('adaptive_enabled', True)
-            adaptive_window = self.config.entropy_budget.get('adaptive_window', 10)
-            
-            self.entropy_ctrl = EntropyBudgetController(
-                target=target,
-                lambda_init=lambda_init,
-                lambda_lr=lambda_lr,
-                alpha=alpha,
-                total_steps=total_steps,
-                adaptive_enabled=adaptive_enabled,
-                adaptive_window=adaptive_window
-            )
-        else:
-            self.entropy_ctrl = None
-
-        # Initialize beta (KL) controller for dual-game RL, independent of reward-KL path
-        if hasattr(self.config, 'critic'):
-            from verl.trainer.ppo.core_algos import get_kl_controller
-            logger.info("Using dual-game policy loss", self.config.critic.kl_ctrl)
-            self.beta_ctrl = get_kl_controller(self.config.critic.kl_ctrl)
-        else:
-            self.beta_ctrl = None
 
     def _validate_config(self):
         config = self.config
@@ -1367,15 +1331,23 @@ class RayPPOTrainer:
                                 logp = batch.batch["old_log_probs"]
                                 prob = torch.exp(logp)
                                 H = -(prob * logp)  # entropy H_t = -p_t * log p_t
-                                w = prob * (1 - prob) * torch.abs(adv)  # w_t = p_t(1-p_t)|Â_t|
+                                ref_logp = batch.batch.get("ref_log_probs", None)
+                                if ref_logp is not None:
+                                    kl_residual = torch.abs(logp - ref_logp)
+                                else:
+                                    kl_residual = torch.ones_like(logp)
+                                w = prob * (1 - prob) * kl_residual * torch.abs(adv)  # 加入KL残差
                                 wH_sum = torch.sum(w * H * resp_mask).item()
                                 
                                 # Update lambda and entropy budget
                                 self.entropy_ctrl.update(wH_sum)
-                                self.entropy_ctrl.decay_target(self.global_steps)
+                                usage_ratio = wH_sum / max(self.entropy_ctrl.target, 1e-8)
+                                self.entropy_ctrl.decay_target(self.global_steps, usage_ratio=usage_ratio)
                                 
                                 # ----- 计算 KL, 更新 beta_ctrl -----
+                                logger.info(f"self.beta_ctrl: {self.beta_ctrl}")
                                 if self.beta_ctrl is not None:
+                                    logger.info(f"self.beta_ctrl: {self.beta_ctrl}")
                                     import torch
                                     current_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                     kld_mat = core_algos.kl_penalty(
@@ -1383,6 +1355,8 @@ class RayPPOTrainer:
                                         current_log_prob,
                                         kl_penalty="low_var_kl",
                                     )
+                                    logger.info(f"kld_mat: {kld_mat}")
+                                    logger.info(f"kld_mat.shape: {kld_mat.shape}")
                                     kld_value = torch.mean(kld_mat * resp_mask).item()
                                     self.beta_ctrl.update(current_kl=kld_value, n_steps=batch.batch_size[0])
                                     beta_val = self.beta_ctrl.value
