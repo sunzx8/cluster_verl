@@ -27,9 +27,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Optional
-import logging
-logger = logging.getLogger(__name__)      # 放在所有代码之前
-logger.setLevel(logging.INFO)
 
 import numpy as np
 import ray
@@ -339,7 +336,7 @@ class RayPPOTrainer:
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to "cuda".
         """
-        logger.info("Using ray trainer000000000000000000000")    
+
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.processor = processor
@@ -387,7 +384,6 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-        
 
     def _validate_config(self):
         config = self.config
@@ -1310,6 +1306,46 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                    # Upload analysis metrics to logger (entropy, covariance, wH, reward)
+                    try:
+                        resp_mask = batch.batch["response_mask"]
+                        logp = batch.batch["old_log_probs"]
+                        adv = batch.batch["advantages"]
+                        rewards = batch.batch["token_level_rewards"]
+
+                        token_cnt = resp_mask.sum().clamp_min(1)
+
+                        # Entropy proxy per token: H = -(p * logp)
+                        prob = torch.exp(logp)
+                        H = -(prob * logp)
+                        H_mean = (H * resp_mask).sum() / token_cnt
+
+                        # Covariance between A and logp over valid tokens
+                        A_mean = (adv * resp_mask).sum() / token_cnt
+                        logp_mean = (logp * resp_mask).sum() / token_cnt
+                        cov_t = (adv - A_mean) * (logp - logp_mean)
+                        cov_mean = (cov_t * resp_mask).sum() / token_cnt
+
+                        # wH with w = p(1-p)*|A|
+                        w = prob * (1 - prob) * torch.abs(adv)
+                        wH = w * H
+                        wH_sum = (wH * resp_mask).sum()
+                        wH_per_token = wH_sum / token_cnt
+
+                        # Reward aggregated per sequence then averaged over batch
+                        reward_seq_sum = (rewards * resp_mask).sum(dim=-1)
+                        reward_sum_mean = reward_seq_sum.mean()
+
+                        metrics.update({
+                            "analysis/entropy_per_token_mean": H_mean.detach().item(),
+                            "analysis/covariance_mean": cov_mean.detach().item(),
+                            "analysis/wH_sum": wH_sum.detach().item(),
+                            "analysis/wH_per_token": wH_per_token.detach().item(),
+                            "analysis/reward_sum_mean": reward_sum_mean.detach().item(),
+                        })
+                    except Exception:
+                        pass
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1319,74 +1355,6 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # Update dual-game coefficients before actor update
-                        if (self.entropy_ctrl is not None and 
-                            hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'loss_mode') and
-                            self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dual_game"):
-                            
-                            with marked_timer("dual_game_update", timing_raw, color="purple"):
-                                # Compute weighted entropy sum: Σ w_t H_t
-                                resp_mask = batch.batch["response_mask"]
-                                adv = batch.batch["advantages"] 
-                                logp = batch.batch["old_log_probs"]
-                                prob = torch.exp(logp)
-                                H = -(prob * logp)  # entropy H_t = -p_t * log p_t
-                                ref_logp = batch.batch.get("ref_log_probs", None)
-                                if ref_logp is not None:
-                                    kl_residual = torch.abs(logp - ref_logp)
-                                else:
-                                    kl_residual = torch.ones_like(logp)
-                                w = prob * (1 - prob) * kl_residual * torch.abs(adv)  # 加入KL残差
-                                wH_sum = torch.sum(w * H * resp_mask).item()
-                                
-                                # Update lambda and entropy budget
-                                self.entropy_ctrl.update(wH_sum)
-                                usage_ratio = wH_sum / max(self.entropy_ctrl.target, 1e-8)
-                                self.entropy_ctrl.decay_target(self.global_steps, usage_ratio=usage_ratio)
-                                
-                                # ----- 计算 KL, 更新 beta_ctrl -----
-                                logger.info(f"self.beta_ctrl: {self.beta_ctrl}")
-                                if self.beta_ctrl is not None:
-                                    logger.info(f"self.beta_ctrl: {self.beta_ctrl}")
-                                    import torch
-                                    current_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                                    kld_mat = core_algos.kl_penalty(
-                                        batch.batch["old_log_probs"],
-                                        current_log_prob,
-                                        kl_penalty="low_var_kl",
-                                    )
-                                    logger.info(f"kld_mat: {kld_mat}")
-                                    logger.info(f"kld_mat.shape: {kld_mat.shape}")
-                                    kld_value = torch.mean(kld_mat * resp_mask).item()
-                                    self.beta_ctrl.update(current_kl=kld_value, n_steps=batch.batch_size[0])
-                                    beta_val = self.beta_ctrl.value
-                                else:
-                                    kld_value = 0.0
-                                    beta_val = 0.0
-
-                                # 写回 config 供日志 & Actor 使用
-                                if not hasattr(self.config, 'dual_game'):
-                                    from omegaconf import DictConfig
-                                    self.config.dual_game = DictConfig({})
-                                self.config.dual_game.beta_coef = beta_val
-
-                                # 广播 λ、β 到 Actor
-                                self.actor_rollout_wg.execute_all_sync(
-                                    "set_loss_coefficients",
-                                    lambda_coef=self.entropy_ctrl.value,
-                                    kl_coef=beta_val,
-                                )
-
-                                # Log dual-game metrics
-                                dual_metrics = {
-                                    "dual_game/lambda": self.entropy_ctrl.value,
-                                    "dual_game/entropy_budget": self.entropy_ctrl.target,
-                                    "dual_game/wH_sum": wH_sum,
-                                    "dual_game/beta": beta_val,
-                                    "dual_game/kl": kld_value,
-                                }
-                                metrics.update(dual_metrics)
-
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
