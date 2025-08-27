@@ -1,17 +1,3 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Copyright 2022 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 Core functions to implement PPO algorithms.
 The function implemented in this file should be used by trainer with different distributed strategies to
@@ -590,302 +576,6 @@ def compute_grpo_passk_outcome_advantage(
     return advantages, advantages
 
 
-@register_adv_est(
-    AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE
-)  # or simply: @register_adv_est("reinforce_plus_plus_baseline")
-def compute_reinforce_plus_plus_baseline_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: torch.Tensor,
-    epsilon: float = 1e-6,
-    config: Optional[AlgoConfig] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for RF++-baseline (https://arxiv.org/abs/2501.03262), operating only on Outcome reward
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        config: (AlgoConfig) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-    response_length = token_level_rewards.shape[-1]
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2mean = {}
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            scores[i] = scores[i] - id2mean[index[i]]
-
-        scores = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
-        scores = verl_F.masked_whiten(scores, response_mask) * response_mask
-
-    return scores, scores
-
-
-@register_adv_est(AdvantageEstimator.RLOO)  # or simply: @register_adv_est("rloo")
-def compute_rloo_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    config: Optional[AlgoConfig] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        config: (AlgoConfig) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2mean = {}
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            response_num = len(id2score[index[i]])
-            if response_num > 1:
-                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[index[i]] * response_num / (
-                    response_num - 1
-                )
-        scores = scores.unsqueeze(-1) * response_mask
-
-    return scores, scores
-
-
-@register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
-def compute_opo_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    config: Optional[AlgoConfig] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for OPO based on https://arxiv.org/pdf/2505.23585
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        config: (AlgoConfig) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-    response_length = response_mask.sum(dim=-1)
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2len = defaultdict(list)
-    id2bsl = {}
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-            id2len[index[i]].append(response_length[i])
-
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2bsl[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                score_tensor = torch.tensor(id2score[idx])
-                len_tensor = torch.tensor(id2len[idx])
-                id2bsl[idx] = (len_tensor * score_tensor).sum() / len_tensor.sum()
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            scores[i] = scores[i] - id2bsl[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
-
-    return scores, scores
-
-
-@register_adv_est(AdvantageEstimator.REINFORCE_PLUS_PLUS)  # or simply: @register_adv_est("reinforce_plus_plus")
-def compute_reinforce_plus_plus_outcome_advantage(
-    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, config: Optional[AlgoConfig] = None, **kwargs
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for REINFORCE++.
-    This implementation is based on the paper: https://arxiv.org/abs/2501.03262
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        config: (AlgoConfig) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-    assert config is not None
-    gamma = config.gamma
-    with torch.no_grad():
-        returns = torch.zeros_like(token_level_rewards)
-        running_return = 0
-
-        for t in reversed(range(token_level_rewards.shape[1])):
-            running_return = token_level_rewards[:, t] + gamma * running_return
-            returns[:, t] = running_return
-            # Reset after EOS
-            running_return = running_return * response_mask[:, t]
-
-        advantages = verl_F.masked_whiten(returns, response_mask)
-        advantages = advantages * response_mask
-
-    return advantages, returns
-
-
-@register_adv_est(AdvantageEstimator.REMAX)  # or simply: @register_adv_est("remax")
-def compute_remax_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    reward_baselines: torch.Tensor,
-    response_mask: torch.Tensor,
-    config: Optional[AlgoConfig] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for ReMax, operating only on Outcome reward
-    This implementation is based on the paper: https://arxiv.org/abs/2310.10505
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        reward_baselines: `(torch.Tensor)`
-            shape: (bs,)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        config: (AlgoConfig) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-
-    with torch.no_grad():
-        returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
-        advantages = returns - reward_baselines.unsqueeze(-1) * response_mask
-
-    return advantages, returns
-
-
-@register_adv_est(AdvantageEstimator.GPG)  # or simply: @register_adv_est("gpg")
-def compute_gpg_outcome_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    index: np.ndarray,
-    epsilon: float = 1e-6,
-    f_norm: float = 1.0,
-    alpha: float = 1.0,
-    config=None,
-    **kwargs,
-):
-    """
-    Compute advantage for GPG, operating only on Outcome reward
-    (with only one scalar reward for each response).
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        index: `(np.ndarray)`
-            shape: (bs,)
-        epsilon: (float)
-        f_norm: (float)
-        alpha: (float)
-        config: (dict) algorithm config
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        Returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-    """
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
-
-    with torch.no_grad():
-        bsz = scores.shape[0]
-        m = torch.count_nonzero(scores)
-        alpha = bsz / m.clamp(min=1)
-
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            scores[i] = alpha * (scores[i] - id2mean[index[i]]) / (f_norm)
-        scores = scores.unsqueeze(-1) * response_mask
-
-    return scores, scores
-
 
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
@@ -1368,6 +1058,7 @@ def compute_pf_ppo_reweight_data(
     return resampled_data
 
 
+@register_policy_loss("dual_game")  # 保持名字不变，配置里无需改
 def compute_policy_loss_dual_game(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
@@ -1378,75 +1069,183 @@ def compute_policy_loss_dual_game(
     config: Optional[AlgoConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute the dual-game policy loss combining PPO-clip, entropy penalty, and KL penalty.
-    
-    Implements the gradient: g_{i,t} = [(Â⁺ + γÂ⁻) − λw_t(−logp−1) − β(logp−logp₀)] · ∇θlogp
-    where w_t = p_t(1−p_t)|Â_t|, H_t = −p_t logp_t
-    
-    Args:
-        old_log_prob (torch.Tensor): Log-probabilities under old policy, shape (batch_size, response_length).
-        log_prob (torch.Tensor): Log-probabilities under current policy, shape (batch_size, response_length).
-        advantages (torch.Tensor): Advantage estimates, shape (batch_size, response_length).
-        response_mask (torch.Tensor): Mask for valid tokens, shape (batch_size, response_length).
-        loss_agg_mode (str): Aggregation mode for loss computation.
-        config (AlgoConfig): Configuration containing dual_game parameters.
-        
-    Returns:
-        tuple: (pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower)
+    BNTO 实现：PPO-clip + 重要性加权熵正则 + KL 正则
+    - I_t = z(C_proxy) + alpha_I * z(H_proxy) + beta_I * z(D_proxy), clamp>=0
+    - 熵梯度用 REINFORCE 形式：lambda * I_t * (-log p - 1)
+    - KL 惩罚：beta * (log p - log p0)
     """
-    logger.info("Using dual-game policy loss")
     if config is None:
-        raise ValueError("config is required for dual_game loss")
-    
-    # Get dual-game parameters
+        raise ValueError("config is required for dual_game(BNTO) loss")
+
     dual_game_config = config.policy_loss.dual_game
     gamma = dual_game_config.get("gamma", 0.8)
-    lambda_coef = dual_game_config.get("lambda_coef", 0.0)
-    
-    # Get beta from dual_game beta coefficient (trainer will update each batch)
-    beta_coef = dual_game_config.get("beta_coef", 0.0)
-    logger.info(f"gamma: {gamma}")
-    logger.info(f"lambda_coef: {lambda_coef}")
-    logger.info(f"beta_coef: {beta_coef}")
-    
-    # Get clipping parameters
-    cliprange = config.clip_ratio
-    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
-    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
-    
-    # Compute modified advantages: Â⁺ + γÂ⁻
+    lambda_coef = float(dual_game_config.get("lambda_coef", 0.0))  # 训练器会每步写入
+    beta_coef   = float(dual_game_config.get("beta_coef", 0.0))    # 训练器会每步写入
+
+    # BNTO 的 I_t 组合权重（可在 config 里设置）
+    alpha_I = float(dual_game_config.get("alpha_I", 0.3))
+    beta_I  = float(dual_game_config.get("beta_I", 0.2))
+    c_I     = float(dual_game_config.get("c_I", 1.0))
+
+    eps = 1e-6
+
+    # ------- 1) 计算 I_t 的三个分量代理（只用到 log_prob / advantages / mask） -------
+    with torch.no_grad():
+        # H_proxy：采样动作的惊奇度（与熵强相关）
+        surpr = (-log_prob)  # shape (bs, T)
+        surpr_mean = verl_F.masked_mean(surpr, response_mask)
+        surpr_c = surpr - surpr_mean  # 中心化
+
+        # D_proxy：优势-惊奇协动（中心化）
+        D_proxy = advantages * surpr_c  # 保留符号以区分错配方向
+
+        # C_proxy：结构复杂度（时间邻接优势差的强度，近似“局部价值跃迁”）
+        adv_shift = torch.roll(advantages, 1, dims=1)
+        adv_shift[:, 0] = advantages[:, 0]
+        C_proxy = torch.abs(advantages - adv_shift)
+
+        # 批内掩码 z-score 归一化 + 截尾（稳健）
+        def _masked_z(x):
+            m = verl_F.masked_mean(x, response_mask)
+            v = verl_F.masked_mean((x - m) ** 2, response_mask)
+            s = torch.sqrt(v + eps)
+            z = (x - m) / (s + eps)
+            # 3σ 截尾
+            return torch.clamp(z, -3.0, 3.0)
+
+        Cn = _masked_z(C_proxy)
+        Hn = _masked_z(surpr)
+        Dn = _masked_z(D_proxy)
+
+        I_t = c_I * Cn + alpha_I * Hn + beta_I * Dn
+        I_t = torch.clamp(I_t, min=0.0)  # 非负，避免反向“奖励”熵
+        I_t = I_t * response_mask  # 遮掉无效 token
+        # I_t 作为权重信号，不反传
+        I_t = I_t.detach()
+
+    # ------- 2) 组装 BNTO 的修正优势 -------
     adv_positive = torch.clamp(advantages, min=0.0)
     adv_negative = torch.clamp(advantages, max=0.0)
     adv_base = adv_positive + gamma * adv_negative
 
-    # Compute entropy penalty: λw_t(−logp−1)
-    prob = torch.exp(log_prob)
-    kl_residual = torch.abs(log_prob - ref_log_prob)  # |log p - log p0|
-    w = prob * (1 - prob) * kl_residual * torch.abs(advantages)  # 加入KL残差权重
-    entropy_penalty = lambda_coef * w * (-log_prob - 1)
-    logger.info(f"compute_policy_loss_dual_game: entropy_penalty: {entropy_penalty}")
+    # 熵项（REINFORCE 形式）：lambda * I_t * (-log p - 1)
+    entropy_term = lambda_coef * I_t * (-log_prob - 1.0)
 
-    # Compute KL penalty: β(logp−logp₀) using reference policy
-    kl_penalty = beta_coef * (log_prob - ref_log_prob)
-    logger.info(f"compute_policy_loss_dual_game: kl_penalty: {kl_penalty}")
+    # KL 项：beta * (log p - log p0)
+    kl_term = beta_coef * (log_prob - ref_log_prob)
 
-    #Combine all terms into modified advantage 
-    # Modified advantage = [(Â⁺ + γÂ⁻) − λw_t(−logp−1) − β(logp−logp₀)]
-    adv_modified = adv_base - entropy_penalty - kl_penalty
-    logger.info(f"compute_policy_loss_dual_game: adv_modified: {adv_modified}")
+    adv_modified = adv_base - entropy_term - kl_term
 
-    
-    # Compute standard PPO clipped loss with modified advantages
-    negative_approx_kl = log_prob - old_log_prob  # For PPO ratio calculation
+    # ------- 3) PPO-clip 外形保持一致 -------
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    
+
     pg_losses1 = -adv_modified * ratio
-    pg_losses2 = -adv_modified * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
-    
+    cliprange = config.clip_ratio
+    clip_low  = config.clip_ratio_low  if config.clip_ratio_low  is not None else cliprange
+    clip_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+    pg_losses2 = -adv_modified * torch.clamp(ratio, 1 - clip_low, 1 + clip_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-    
+    pg_clipfrac = verl_F.masked_mean((pg_losses2 > pg_losses1).float(), response_mask)
+
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    
-    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)
+
+    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0, device=pg_loss.device)
+
+# === NEW: Trie-based structural complexity (no critic needed) ==================
+import torch
+
+@torch.no_grad()
+def compute_structural_complexity_trie(
+    responses: torch.Tensor,          # (bs, T) int tokens
+    response_mask: torch.Tensor,      # (bs, T) bool or 0/1
+    seq_scores: torch.Tensor,         # (bs,)  每条轨迹的“序列分”（如 token_level_rewards.sum(-1))
+    group_ids: torch.Tensor,          # (bs,)  同一 prompt 的分组 id (GRPO 的 index)
+    reduce: str = "var",              # "var" | "iqr" | "maxmin"
+    agg: str = "median",              # 分支分数聚合: "mean" | "median"
+    min_branch_size: int = 1,         # 每个分支最小样本数
+) -> torch.Tensor:
+    """
+    基于“前缀树分叉归因”的结构复杂度 C_t：
+    对同一组 (同一 prompt) 的 K 条轨迹，在每个位置 t:
+      - 只看 response_mask 为 True 的轨迹；
+      - 若 t 处出现 >=2 个不同 token，则按 token 分组，对各组汇总该组的“序列分”；
+      - 用分支分数的方差/四分位距/IQR/极差来定义该位置的分叉复杂度；
+      - 将该复杂度赋给组内所有在 t 位置有效的样本（表示“该前缀状态”的复杂度），无效处为 0。
+    无需 critic；与 GRPO/SRPO 的多轨迹天然契合。
+    """
+    device = responses.device
+    bs, T = responses.shape
+    C = torch.zeros((bs, T), device=device, dtype=torch.float32)
+
+    # 统一 mask 为 bool
+    if response_mask.dtype != torch.bool:
+        resp_mask_bool = response_mask > 0
+    else:
+        resp_mask_bool = response_mask
+
+    # group_ids 统一到 torch.long
+    if not torch.is_tensor(group_ids):
+        group_ids = torch.as_tensor(group_ids, device=device)
+    group_ids = group_ids.to(device=device, dtype=torch.long)
+
+    unique_gids = torch.unique(group_ids)
+
+    for gid in unique_gids:
+        idx = (group_ids == gid).nonzero(as_tuple=False).squeeze(-1)  # 该组的样本索引
+        if idx.numel() == 0:
+            continue
+
+        seqs = responses[idx]                    # (K, T)
+        mask = resp_mask_bool[idx]               # (K, T)
+        scores = seq_scores[idx].float()         # (K,)
+
+        # 按位置扫描分叉
+        for t in range(T):
+            valid = mask[:, t]                   # (K,)
+            if valid.sum().item() < 2:
+                continue
+
+            tok_t = seqs[valid, t]               # 有效样本在 t 的 token
+            uniq = torch.unique(tok_t)
+            if uniq.numel() < 2:
+                continue  # 没有分叉
+
+            # 计算各分支的“分支分数” S(p->v)：分到该 token 的样本的序列分的均值/中位数
+            branch_vals = []
+            for v in uniq:
+                sel = (tok_t == v)               # 有效子集内部的 mask
+                if sel.sum().item() < min_branch_size:
+                    continue
+                # 映射回原 scores：先在 valid 内选择，再用 sel 二次筛
+                s = scores[valid][sel]
+                if s.numel() == 0:
+                    continue
+                if agg == "mean":
+                    branch_vals.append(s.mean())
+                else:  # "median"
+                    branch_vals.append(s.median())
+
+            if len(branch_vals) < 2:
+                continue  # 有效分支不足两类
+
+            branch_vals = torch.stack(branch_vals)  # (B,)
+
+            # 分支差异 → 结构复杂度
+            if reduce == "var":
+                c_branch = torch.var(branch_vals, unbiased=False)
+            elif reduce == "iqr":
+                q = torch.quantile(branch_vals, torch.tensor([0.25, 0.75], device=device))
+                c_branch = q[1] - q[0]
+            elif reduce == "maxmin":
+                c_branch = branch_vals.max() - branch_vals.min()
+            else:
+                raise ValueError(f"Unknown reduce={reduce}")
+
+            # 将该位置的复杂度赋给“该组在 t 位置的所有有效样本”
+            # 解释：C_t 是“该前缀状态”的属性，与该时刻选了哪个 token 无关
+            C[idx[valid], t] = c_branch
+
+    return C

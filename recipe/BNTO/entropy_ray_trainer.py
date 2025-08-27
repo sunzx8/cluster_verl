@@ -362,104 +362,123 @@ class RayEntropyTrainer(RayPPOTrainer):
                             hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'loss_mode') and
                             self.config.actor_rollout_ref.actor.policy_loss.loss_mode == "dual_game"):
                             
-                            with marked_timer("dual_game_update", timing_raw, color="purple"):
-                                # 计算奖励标准差
-                                token_rewards = batch.batch["token_level_rewards"]
-                                resp_mask = batch.batch["response_mask"]
-                                valid_rewards = token_rewards[resp_mask.bool()]
-                                reward_std = torch.std(valid_rewards).item() if len(valid_rewards) > 0 else 0.0
-                                
-                                # 计算加权熵
-                                resp_mask = batch.batch["response_mask"]
-                                adv = batch.batch["advantages"] 
-                                logp = batch.batch["old_log_probs"]
-                                prob = torch.exp(logp)
-                                H = -(prob * logp)
-                                ref_logp = batch.batch.get("ref_log_probs", None)
-                                if ref_logp is not None:
-                                    kl_residual = torch.abs(logp - ref_logp)
-                                else:
-                                    kl_residual = torch.ones_like(logp)
-                                w = prob * (1 - prob) * kl_residual * torch.abs(adv)
-                                
-                                wH_sum = torch.sum(w * H * resp_mask)
-                                token_count = torch.sum(resp_mask)
-                                
-                                # 更新熵预算控制器（传入奖励标准差以及预算使用率）
-                                self.entropy_ctrl.update(wH_sum.item(), token_count.item())
-                                usage_ratio = wH_sum.item() / max(self.entropy_ctrl.target, 1e-8)
-                                self.entropy_ctrl.decay_target(self.global_steps, reward_std, usage_ratio)
+                           with marked_timer("dual_game_update", timing_raw, color="purple"):
+                                # === 当前策略 logp/entropy、adv/mask ===
+                                curr = self.actor_rollout_wg.compute_log_prob(batch)
+                                logp = curr.batch["old_log_probs"]               # (bs, T)
+                                H    = curr.batch["entropys"]                    # (bs, T)
+                                resp_mask = batch.batch["response_mask"].to(logp.dtype)
+                                adv  = batch.batch["advantages"]                 # (bs, T)
 
-                                # ----- 计算 KL, 更新 beta_ctrl -----
-                                if self.beta_ctrl is not None:
-                                    # 计算当前策略和旧策略之间的 KL 散度
+                                # 取 responses / seq_scores / group_ids
+                                responses = batch.batch["responses"]             # (bs, T) int tokens
+                                response_mask_bool = batch.batch["response_mask"].bool()  # (bs, T)
+                                seq_scores = batch.batch["token_level_rewards"].sum(dim=-1)  # (bs,)
+
+                                # group_ids 兼容性读取
+                                if "index" in batch.non_tensor_batch:
+                                    group_ids = batch.non_tensor_batch["index"]
+                                elif "index" in batch.batch:
+                                    group_ids = batch.batch["index"]
+                                else:
+                                    raise KeyError("BNTO(trie): group index 'index' not found in batch (non_tensor_batch or batch).")
+
+                                # === 计算 Trie 分叉归因的 C_proxy（无需 critic） ===
+                                C_proxy = core_algos.compute_structural_complexity_trie(
+                                    responses=responses,
+                                    response_mask=response_mask_bool,
+                                    seq_scores=seq_scores,
+                                    group_ids=group_ids,
+                                    reduce=getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "c_reduce", "var"),
+                                    agg=getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "c_agg", "median"),
+                                    min_branch_size=getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "c_min_branch_size", 1),
+                                ).to(logp.dtype)
+
+                                # === 惊奇度与中心化（H 的单样本近似；后面算 D）===
+                                eps = 1e-6
+                                surpr = (-logp)
+                                # 每条样本内做加权平均（掩码）
+                                surpr_mean = torch.sum(surpr * resp_mask, dim=1, keepdim=True) / (torch.sum(resp_mask, dim=1, keepdim=True) + eps)
+                                surpr_c = surpr - surpr_mean
+                                D_proxy = adv * surpr_c
+
+                                # === 掩码内 z-score 归一化 + 截尾 ===
+                                def masked_z(x, m):
+                                    num = torch.sum(x * m, dim=1, keepdim=True)
+                                    den = torch.sum(m, dim=1, keepdim=True) + eps
+                                    mean = num / den
+                                    var  = torch.sum(((x - mean) ** 2) * m, dim=1, keepdim=True) / den
+                                    std  = torch.sqrt(var + eps)
+                                    z = (x - mean) / (std + eps)
+                                    return torch.clamp(z, -3.0, 3.0)
+
+                                alpha_I = float(getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "alpha_I", 0.3))
+                                beta_I  = float(getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "beta_I", 0.2))
+                                c_I     = float(getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "c_I", 1.0))
+
+                                Cn = masked_z(C_proxy, resp_mask)
+                                Hn = masked_z(surpr,   resp_mask)
+                                Dn = masked_z(D_proxy, resp_mask)
+
+                                I_t = torch.clamp(c_I * Cn + alpha_I * Hn + beta_I * Dn, min=0.0) * resp_mask
+                                I_t = I_t.detach()
+
+                                # === wH 累计 & 控制器更新（与原来一致，只是 w 换成 I_t）===
+                                wH_sum = torch.sum(I_t * H * resp_mask)
+                                token_count = torch.sum(resp_mask)
+
+                                self.entropy_ctrl.update(current_wH_sum=wH_sum.item(), token_count=int(token_count.item()))
+
+                                token_rewards = batch.batch["token_level_rewards"]
+                                valid_rewards = token_rewards[response_mask_bool]
+                                reward_std = torch.std(valid_rewards).item() if valid_rewards.numel() > 0 else 0.0
+                                usage_ratio = (wH_sum.item() / (self.entropy_ctrl.target + 1e-8))
+                                self.entropy_ctrl.decay_target(self.global_steps, reward_std=reward_std, usage_ratio=usage_ratio)
+
+                                # === KL 控制器（β）更新 & 广播（保持你之前逻辑）===
+                                beta_val = 0.0
+                                kld_value = 0.0
+                                if self.beta_ctrl is not None and "ref_log_probs" in batch.batch:
                                     kld_mat = core_algos.kl_penalty(
-                                        batch.batch["old_log_probs"],
-                                        batch.batch["ref_log_prob"],
+                                        logprob=batch.batch["old_log_probs"],
+                                        ref_logprob=batch.batch["ref_log_probs"],
                                         kl_penalty="low_var_kl",
                                     )
-                                    kld_value = torch.mean(kld_mat * resp_mask).item()
-                                    self.beta_ctrl.update(current_kl=kld_value, n_steps=len(batch))
-                                    beta_val = self.beta_ctrl.value
-                                    print(f"beta_val: {beta_val}")
-                                else:
-                                    kld_value = 0.0
-                                    beta_val = 0.0
+                                    kld_value = torch.sum(kld_mat * resp_mask) / (token_count + 1e-8)
+                                    self.beta_ctrl.update(current_kl=float(kld_value.item()), n_steps=len(batch))
+                                    beta_val = float(self.beta_ctrl.value)
 
-                                # 写回 config 供日志 & Actor 使用
+                                # 写回 config 并广播（与原先相同）
                                 if not hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'dual_game'):
-                                    from omegaconf import DictConfig, open_dict
+                                    from omegaconf import DictConfig
                                     with open_dict(self.config.actor_rollout_ref.actor.policy_loss):
                                         self.config.actor_rollout_ref.actor.policy_loss.dual_game = DictConfig({})
-                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.beta_coef = beta_val
-                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = self.entropy_ctrl.value
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.lambda_coef = float(self.entropy_ctrl.value)
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.beta_coef   = float(beta_val)
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.alpha_I     = float(alpha_I)
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.beta_I      = float(beta_I)
+                                self.config.actor_rollout_ref.actor.policy_loss.dual_game.c_I         = float(c_I)
 
-                                                                # 广播 λ、β 到 Actor
-                                print(f"222222332323232323232323Broadcasting lambda and beta to Actor: {self.entropy_ctrl.value}, {beta_val}")
                                 self.actor_rollout_wg.execute_all_sync(
                                     "set_loss_coefficients",
-                                    lambda_coef=self.entropy_ctrl.value,
-                                    kl_coef=beta_val,
+                                    lambda_coef=float(self.entropy_ctrl.value),
+                                    kl_coef=float(beta_val),
                                 )
 
-                                
-                                # 计算额外的分析指标
-                                # KL门控加权熵
-                                w_kl_gated = w * kl_residual
-                                wH_kl_gated = torch.sum(w_kl_gated * H * resp_mask) / token_count
-                                
-                                # KL per token (使用真正的KL散度)
-                                if self.beta_ctrl is not None:
-                                    # 使用已经计算好的kld_mat
-                                    kl_per_token = torch.mean(kld_mat * resp_mask)
-                                else:
-                                    kl_per_token = torch.tensor(0.0)
-                                
-                                # 平均熵
-                                token_entropy_mean = torch.sum(H * resp_mask) / token_count
-                                
-                                # 使用率
-                                B_token = self.entropy_ctrl.target / token_count.item()
-                                usage_ratio_basic = wH_sum.item() / max(B_token, 1e-8)
-                                usage_ratio_kl_gated = wH_kl_gated.item() / max(B_token, 1e-8)
-                                
-                                # 添加分析指标（复用已有计算）
-                                dual_game_metrics = {
-                                    "dual_game/per_token_budget_Bt": self.entropy_ctrl.target / token_count.item(),
-                                    "dual_game/wH_per_token_basic": wH_sum.item() / token_count.item(),
-                                    "dual_game/wH_per_token_kl_gated": wH_kl_gated.item(),
-                                    "dual_game/B_token": B_token,
-                                    "dual_game/lambda": self.entropy_ctrl.value,
+                                # 记录指标（保持你之前版本的指标，或按需扩展）
+                                B_token = float(self.entropy_ctrl.target) / (float(token_count.item()) + 1e-8)
+                                token_entropy_mean = (torch.sum(H * resp_mask) / (token_count + 1e-8)).item()
+                                metrics.update({
+                                    "dual_game/per_token_budget_Bt": B_token,
+                                    "dual_game/wH_per_token": (wH_sum.item() / (token_count.item() + 1e-8)),
+                                    "dual_game/lambda": float(self.entropy_ctrl.value),
                                     "dual_game/beta": beta_val,
-                                    "dual_game/KL_per_token": kl_per_token.item(),
-                                    "dual_game/usage_ratio_basic": usage_ratio_basic,
-                                    "dual_game/usage_ratio_kl_gated": usage_ratio_kl_gated,
-                                    "dual_game/token_entropy_mean": token_entropy_mean.item(),
+                                    "dual_game/KL_per_token": float(kld_value),
+                                    "dual_game/token_entropy_mean": token_entropy_mean,
                                     "dual_game/reward_std": reward_std,
-                                    "dual_game/token_count": token_count.item(),
-                                }
-                                
-                                metrics.update(dual_game_metrics)
+                                    "dual_game/token_count": int(token_count.item()),
+                                })
+
 
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
