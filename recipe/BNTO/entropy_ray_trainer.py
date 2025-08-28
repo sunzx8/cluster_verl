@@ -383,7 +383,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                 else:
                                     raise KeyError("BNTO(trie): group index 'index' not found in batch (non_tensor_batch or batch).")
 
-                                # === 计算 Trie 分叉归因的 C_proxy（无需 critic） ===
+                                # === 计算 Trie 分叉归因（top-k）的 C_proxy（无需 critic） ===
                                 C_proxy = core_algos.compute_structural_complexity_trie(
                                     responses=responses,
                                     response_mask=response_mask_bool,
@@ -394,7 +394,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                     min_branch_size=getattr(self.config.actor_rollout_ref.actor.policy_loss.dual_game, "c_min_branch_size", 1),
                                 ).to(logp.dtype)
 
-                                # === 惊奇度与中心化（H 的单样本近似；后面算 D）===
+                                # === 差异度与中心化（H 的单样本近似；后面算 D）===
                                 eps = 1e-6
                                 surpr = (-logp)
                                 # 每条样本内做加权平均（掩码）
@@ -435,7 +435,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                 usage_ratio = (wH_sum.item() / (self.entropy_ctrl.target + 1e-8))
                                 self.entropy_ctrl.decay_target(self.global_steps, reward_std=reward_std, usage_ratio=usage_ratio)
 
-                                # === KL 控制器（β）更新 & 广播（保持你之前逻辑）===
+                                # === KL 控制器（β）更新 & 广播===
                                 beta_val = 0.0
                                 kld_value = 0.0
                                 if self.beta_ctrl is not None and "ref_log_probs" in batch.batch:
@@ -448,7 +448,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                     self.beta_ctrl.update(current_kl=float(kld_value.item()), n_steps=len(batch))
                                     beta_val = float(self.beta_ctrl.value)
 
-                                # 写回 config 并广播（与原先相同）
+                                # 写回 config 并广播
                                 if not hasattr(self.config.actor_rollout_ref.actor.policy_loss, 'dual_game'):
                                     from omegaconf import DictConfig
                                     with open_dict(self.config.actor_rollout_ref.actor.policy_loss):
@@ -465,7 +465,7 @@ class RayEntropyTrainer(RayPPOTrainer):
                                     kl_coef=float(beta_val),
                                 )
 
-                                # 记录指标（保持你之前版本的指标，或按需扩展）
+                                # 记录指标
                                 B_token = float(self.entropy_ctrl.target) / (float(token_count.item()) + 1e-8)
                                 token_entropy_mean = (torch.sum(H * resp_mask) / (token_count + 1e-8)).item()
                                 metrics.update({
